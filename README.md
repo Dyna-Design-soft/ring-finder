@@ -52,6 +52,22 @@ Board defaults: **10×7 squares, `DICT_4X4_50`, marker ≈ 0.68 × square**
 > problem — do not depend on it, so undistortion works even before you know
 > the exact square size. Set it correctly when you need absolute millimetres.
 
+## Check a set before you trust it (`--check`)
+
+Run this first on any new set — it reports each image's out-of-plane board
+tilt and writes an annotated `tilt_check.png`, without calibrating:
+
+```bash
+python calibrate.py yourfolder/ --check
+```
+
+```
+board tilt (deg): min 4.7  mean 23.6  max 38.1  (90th 31.5)
+VERDICT: good tilt variety.
+```
+
+If it says **NOT ENOUGH TILT**, re-shoot before going further (see below).
+
 ## Read the quality verdict — this is the important part
 
 A tiny reprojection error does **not** mean the calibration is usable. The

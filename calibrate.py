@@ -324,6 +324,91 @@ def calibrate(folder, square_mm, marker_mm, squares_x, squares_y,
     return result
 
 
+def check_set(folder, square_mm, marker_mm, squares_x, squares_y,
+              dict_name, out_dir=None):
+    """Diagnose a calibration image set WITHOUT calibrating.
+
+    Reports each image's out-of-plane board tilt and writes an annotated
+    contact sheet, so you can confirm the set has enough pose variety before
+    trusting a calibration built from it. Tilt is estimated with a fixed,
+    sane camera guess so the read-out does not depend on (and cannot be
+    fooled by) a degenerate calibration.
+    """
+    dictionary = _get_dictionary(dict_name)
+    board = _make_board(squares_x, squares_y, square_mm, marker_mm, dictionary)
+    charuco_detector = cv2.aruco.CharucoDetector(board)
+
+    images = _list_images(folder)
+    if not images:
+        print("no images found in " + folder)
+        return None
+
+    # neutral guess: focal ~ image width, centre at the middle, no distortion
+    probe = cv2.imread(images[0])
+    h, w = probe.shape[:2]
+    Kg = np.array([[float(w), 0, (w - 1) / 2.0],
+                   [0, float(w), (h - 1) / 2.0], [0, 0, 1.0]])
+    zero = np.zeros(5)
+
+    tiles, tilts = [], []
+    print("Checking %d images (tilt = out-of-plane board angle) ..." % len(images))
+    for path in images:
+        img = cv2.imread(path)
+        if img is None:
+            continue
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        ch_c, ch_i, _, _ = charuco_detector.detectBoard(gray)
+        tilt = None
+        if ch_i is not None and len(ch_i) >= 6:
+            op, ip = board.matchImagePoints(ch_c, ch_i)
+            if op is not None and len(op) >= 6:
+                ok, rvec, _ = cv2.solvePnP(op, ip, Kg, zero)
+                if ok:
+                    R, _ = cv2.Rodrigues(rvec)
+                    tilt = float(np.degrees(np.arccos(min(1.0, abs(R[2, 2])))))
+                    for pt in ip.reshape(-1, 2).astype(int):
+                        cv2.circle(img, tuple(pt), 3, (0, 255, 0), -1)
+        if tilt is not None:
+            tilts.append(tilt)
+        label = ("tilt=%.1f  %s" % (tilt, "FLAT" if tilt < 8 else "tilted")
+                 if tilt is not None else "no board")
+        print("  %-28s %s" % (os.path.basename(path), label))
+        vis = cv2.resize(img, (320, 240))
+        cv2.rectangle(vis, (0, 0), (320, 20), (0, 0, 0), -1)
+        cv2.putText(vis, label, (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (0, 0, 255) if (tilt is None or tilt < 8) else (0, 255, 0),
+                    1, cv2.LINE_AA)
+        tiles.append(vis)
+
+    tarr = np.array(tilts) if tilts else np.array([0.0])
+    p90 = float(np.percentile(tarr, 90))
+    print("-" * 52)
+    print("  board tilt (deg): min %.1f  mean %.1f  max %.1f  (90th %.1f)"
+          % (tarr.min(), tarr.mean(), tarr.max(), p90))
+    if p90 < 8:
+        print("  VERDICT: NOT ENOUGH TILT - do not calibrate from this set.")
+        print("           Re-shoot with the board tipped 20-45 deg toward/away")
+        print("           and left/right (it should look like a TRAPEZOID, not")
+        print("           a rectangle, in most shots).")
+    elif p90 < 18:
+        print("  VERDICT: marginal tilt - more would help.")
+    else:
+        print("  VERDICT: good tilt variety.")
+
+    out_dir = out_dir or folder
+    os.makedirs(out_dir, exist_ok=True)
+    cols = 6
+    rows = (len(tiles) + cols - 1) // cols
+    sheet = np.full((rows * 240, cols * 320, 3), 40, np.uint8)
+    for k, t in enumerate(tiles):
+        r, c = divmod(k, cols)
+        sheet[r * 240:r * 240 + 240, c * 320:c * 320 + 320] = t
+    sheet_path = os.path.join(out_dir, "tilt_check.png")
+    cv2.imwrite(sheet_path, sheet)
+    print("  -> " + sheet_path)
+    return {"tilt_pct90": p90, "num_boards": len(tilts)}
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="Camera calibration from ChArUco board images.")
@@ -344,6 +429,10 @@ def build_parser():
                    help="output folder (default: the image folder)")
     p.add_argument("--no-previews", action="store_true",
                    help="do not write undistorted preview images")
+    p.add_argument("--check", action="store_true",
+                   help="only diagnose the set's pose variety (per-image "
+                        "board tilt + annotated tilt_check.png); do not "
+                        "calibrate")
     return p
 
 
@@ -351,6 +440,11 @@ if __name__ == "__main__":
     args = build_parser().parse_args()
     marker_mm = args.marker_mm if args.marker_mm is not None \
         else args.square_mm * MARKER_RATIO
-    calibrate(args.folder, args.square_mm, marker_mm,
-              args.squares_x, args.squares_y, args.dict_name,
-              out_dir=args.out, save_previews=not args.no_previews)
+    if args.check:
+        check_set(args.folder, args.square_mm, marker_mm,
+                  args.squares_x, args.squares_y, args.dict_name,
+                  out_dir=args.out)
+    else:
+        calibrate(args.folder, args.square_mm, marker_mm,
+                  args.squares_x, args.squares_y, args.dict_name,
+                  out_dir=args.out, save_previews=not args.no_previews)
