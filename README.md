@@ -46,6 +46,38 @@ with its ring(s) circled, a results table (pixel + robot XY), and a log.
 **Open image...** runs a single file on demand. The model loads once on a
 background thread, so the window stays responsive.
 
+## Standalone configurable app (`scripts/ring_app.py`)
+
+A self-contained operator app (independent of the other scripts) with three
+tabs:
+
+- **Live** — Start/Stop watching, annotated image, results table, log.
+- **Configuration** — all settings, saved to `config/app_config.json`:
+  watch folder, image extension, poll time, output CSV, **XY offset (mm)**,
+  **auto-delete images older than N min**, calibration (homography) file, the
+  **FastSAM detection parameters** (`model, conf, iou, min/max_area_frac,
+  min_circ, min_radius_frac`), and a **TCP server** (host/port/line format).
+- **Calibration** — build the pixel→robot homography in-app: **Grab latest
+  from folder** or **Load image…** → the ring pixel is detected → type the
+  **Robot X/Y** for that ring → **Add point**; collect ≥4 points, then
+  **Fit & Save** writes the homography file (with in-fit and leave-one-out
+  RMS, and RANSAC-flagged bad points).
+
+```bash
+python scripts/ring_app.py
+```
+
+Behaviour notes:
+- **Watcher re-fires on a changed file too**, not only new names — so a camera
+  that overwrites one fixed filename still triggers each frame (detects new
+  name **or** changed modification time; waits for the file to stop changing
+  first).
+- **TCP server**: enable it and the robot connects as a client; each detection
+  is sent as `{id},{x},{y}` lines (format configurable with
+  `{id} {x} {y} {dia} {image}`).
+- **Robot XY = homography(pixel) + (offset_x, offset_y)**; written to the CSV
+  and broadcast over TCP.
+
 ## Quick start — command line
 
 ```bash
