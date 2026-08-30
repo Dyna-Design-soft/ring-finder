@@ -94,9 +94,10 @@ tabs:
   when no ring is found. Shows the **processing time** per image (detection
   ms and total ms). Click a table column header to re-sort the view.
 
-  > Timing note: on CPU, `FastSAM-x` is ~2–3 s per image; the mm/robot
-  > mapping is <1 ms. For faster cycles set `MODEL = FastSAM-s.pt` in
-  > Configuration (lighter/faster) or run on a CUDA GPU.
+  > Timing note: with the tuned default `imgsz=640`, `FastSAM-x` is
+  > ~0.8–0.9 s/image on CPU (vs ~2.5 s at 1024) and detections are actually
+  > more repeatable, because the source is only ~320×240 - larger imgsz just
+  > adds interpolation noise. Tune `imgsz` on the Detection tab.
 - **Configuration** — sub-tabs (General / Detection / Output / TCP / Robot)
   with a fixed Save bar; **starts watching automatically on open** (toggle in
   General). All settings saved to `config/app_config.json`:

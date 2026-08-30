@@ -70,6 +70,7 @@ DEFAULT_CONFIG = {
     "model": "FastSAM-x.pt",
     "model_type": "auto",           # auto | fastsam | yolo | sam
     "subpixel": True,               # least-squares circle fit (more precise)
+    "imgsz": 640,                   # inference size; 640 best for ~320x240 input
     "conf": 0.20,
     "iou": 0.7,
     "min_area_frac": 0.004,
@@ -531,7 +532,8 @@ class Detector:
         max_af = float(cfg.get("max_area_frac", 0.25))
         min_circ = float(cfg.get("min_circ", 0.75))
         subpixel = bool(cfg.get("subpixel", True))
-        res = self._predict(img, conf, iou, 1024)
+        imgsz = int(cfg.get("imgsz", 640))
+        res = self._predict(img, conf, iou, imgsz)
         rings = []
 
         def add(x, y, r):
@@ -1095,6 +1097,12 @@ class App:
                         variable=self.subpixel_var).grid(
             row=r0, column=1, sticky=tk.W, pady=(6, 0))
         r0 += 1
+        self._config_row(t_det, r0, "imgsz", "Inference size (imgsz)", "text")
+        r0 += 1
+        ttk.Label(t_det, text="imgsz 640 is fastest+most repeatable for ~320x240 "
+                             "input; higher just adds interpolation noise.",
+                  foreground="#777").grid(row=r0, column=1, sticky=tk.W)
+        r0 += 1
         self.measure_inner_var = tk.BooleanVar(
             value=bool(self.cfg.get("measure_inner")))
         ttk.Checkbutton(t_det, text="Also measure inner diameter (hole)",
@@ -1325,6 +1333,7 @@ class App:
             self.cfg["inner_sat_thresh"] = int(self.vars["inner_sat_thresh"].get())
             self.cfg["model_type"] = self.model_type_var.get() or "auto"
             self.cfg["subpixel"] = bool(self.subpixel_var.get())
+            self.cfg["imgsz"] = int(self.vars["imgsz"].get())
             self.cfg["tcp_enabled"] = bool(self.tcp_enabled_var.get())
             self.cfg["tcp_host"] = self.vars["tcp_host"].get() or "0.0.0.0"
             self.cfg["tcp_port"] = int(self.vars["tcp_port"].get())
