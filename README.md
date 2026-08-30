@@ -138,6 +138,24 @@ python pixel_to_mm.py to-mm calibration.json --Z 300 --u 210 --v 128
 `X_mm = (u − cx)·Z/fx`, `Y_mm = (v − cy)·Z/fy`. Only correct when the camera
 is truly perpendicular and `Z` is known; the homography handles tilt for you.
 
+### Batch: convert ai.py detections to mm (`rings_to_mm.py`)
+
+`rings_to_mm.py` reads the `*_rings.json` files from `ai.py`, converts every
+ring's centre and outer diameter to mm, and writes `x_mm`, `y_mm`,
+`diameter_mm` back into each JSON. Pick one scale source:
+
+```bash
+# best: homography from a board photo taken flat on the belt
+python rings_to_mm.py calibration.json parts/ --map belt_map.json
+
+# perpendicular camera at a known working distance (mm)
+python rings_to_mm.py calibration.json parts/ --Z 300
+
+# calibrate the scale from one ring whose true outer diameter you know
+python rings_to_mm.py calibration.json parts/ \
+       --ref-mm 24 --ref-json parts/first_rings.json --ref-id 1
+```
+
 ### In your own code
 
 ```python
