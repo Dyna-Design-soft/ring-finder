@@ -65,8 +65,10 @@ DEFAULT_CONFIG = {
     "homography_file": os.path.join(ROOT, "config", "robot_map.json"),
     "intrinsics_file": os.path.join(ROOT, "config", "calibration.json"),  # optional
     "undistort": False,             # distortion-aware map (needs intrinsics_file)
-    # ---- FastSAM detection parameters ----
+    # ---- detection parameters ----
     "model": "FastSAM-x.pt",
+    "model_type": "auto",           # auto | fastsam | yolo | sam
+    "subpixel": True,               # least-squares circle fit (more precise)
     "conf": 0.20,
     "iou": 0.7,
     "min_area_frac": 0.004,
@@ -442,15 +444,61 @@ class TcpServer:
 
 # ---------------- detection ----------------
 
+def fit_circle_ls(pts):
+    """Least-squares (Kasa) circle fit to Nx2 points -> (cx, cy, r).
+    More accurate/stable than minEnclosingCircle, which is biased outward."""
+    pts = np.asarray(pts, np.float64)
+    x, y = pts[:, 0], pts[:, 1]
+    A = np.c_[2 * x, 2 * y, np.ones(len(x))]
+    b = x * x + y * y
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy, cc = sol
+    r2 = cc + cx * cx + cy * cy
+    if not np.isfinite(r2) or r2 <= 0:
+        raise ValueError("bad circle fit")
+    return float(cx), float(cy), float(np.sqrt(r2))
+
+
 class Detector:
     def __init__(self):
         self.model = None
         self.model_name = None
+        self.kind = None
 
-    def load(self, name):
-        if self.model is None or name != self.model_name:
+    @staticmethod
+    def resolve_kind(name, want="auto"):
+        want = (want or "auto").lower()
+        if want in ("fastsam", "yolo", "sam"):
+            return want
+        n = os.path.basename(str(name)).lower()
+        if "fastsam" in n:
+            return "fastsam"
+        if "sam" in n:
+            return "sam"
+        return "yolo"                    # yolo / custom-trained .pt
+
+    def load(self, name, model_type="auto"):
+        kind = self.resolve_kind(name, model_type)
+        if self.model is not None and name == self.model_name and kind == self.kind:
+            return
+        if kind == "fastsam":
+            from ultralytics import FastSAM
             self.model = FastSAM(name)
-            self.model_name = name
+        elif kind == "sam":
+            from ultralytics import SAM
+            self.model = SAM(name)
+        else:
+            from ultralytics import YOLO
+            self.model = YOLO(name)
+        self.model_name = name
+        self.kind = kind
+
+    def _predict(self, img, conf, iou, imgsz):
+        if self.kind == "fastsam":
+            return self.model(img, device="cpu", retina_masks=True, imgsz=imgsz,
+                              conf=conf, iou=iou, verbose=False)[0]
+        return self.model(img, device="cpu", imgsz=imgsz, conf=conf, iou=iou,
+                          verbose=False)[0]
 
     def find_rings(self, img, cfg):
         H, W = img.shape[:2]
@@ -460,28 +508,47 @@ class Detector:
         min_af = float(cfg.get("min_area_frac", 0.004))
         max_af = float(cfg.get("max_area_frac", 0.25))
         min_circ = float(cfg.get("min_circ", 0.75))
-        res = self.model(img, device="cpu", retina_masks=True, imgsz=1024,
-                         conf=conf, iou=iou, verbose=False)[0]
+        subpixel = bool(cfg.get("subpixel", True))
+        res = self._predict(img, conf, iou, 1024)
         rings = []
-        if res.masks is None:
-            return rings
-        for m in res.masks.data.cpu().numpy():
-            mask = (m > 0.5).astype(np.uint8)
-            a = int(mask.sum())
-            if a < min_af * H * W or a > max_af * H * W:
-                continue
-            cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-            c = max(cnts, key=cv2.contourArea)
-            (x, y), r = cv2.minEnclosingCircle(c)
-            peri = cv2.arcLength(c, True)
-            circ = 4 * np.pi * cv2.contourArea(c) / (peri * peri) if peri else 0
-            if circ < min_circ or r < min_r:
-                continue
+
+        def add(x, y, r):
+            if r < min_r:
+                return
             if any((x - rx) ** 2 + (y - ry) ** 2 < (0.5 * max(r, rr)) ** 2
                    for rx, ry, rr in rings):
-                continue
+                return
             rings.append((x, y, r))
+
+        masks = getattr(res, "masks", None)
+        if masks is not None and masks.data is not None:
+            for m in masks.data.cpu().numpy():
+                mask = (m > 0.5).astype(np.uint8)
+                a = int(mask.sum())
+                if a < min_af * H * W or a > max_af * H * W:
+                    continue
+                cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                           cv2.CHAIN_APPROX_SIMPLE)
+                c = max(cnts, key=cv2.contourArea)
+                (x, y), r = cv2.minEnclosingCircle(c)
+                peri = cv2.arcLength(c, True)
+                circ = 4 * np.pi * cv2.contourArea(c) / (peri * peri) if peri else 0
+                if circ < min_circ:
+                    continue
+                if subpixel and len(c) >= 5:
+                    try:
+                        x, y, r = fit_circle_ls(c.reshape(-1, 2))
+                    except Exception:
+                        pass
+                add(x, y, r)
+        else:
+            # detection-only model (no masks): use bounding boxes as circles
+            boxes = getattr(res, "boxes", None)
+            if boxes is not None:
+                for b in boxes.xyxy.cpu().numpy():
+                    x1, y1, x2, y2 = b
+                    add((x1 + x2) / 2.0, (y1 + y2) / 2.0,
+                        min(x2 - x1, y2 - y1) / 2.0)
         return sorted(rings, key=lambda t: (t[1], t[0]))
 
 
@@ -692,7 +759,8 @@ class Worker(threading.Thread):
                      % (removed, mins))
 
     def _detect(self, path):
-        self.det.load(self.cfg.get("model", "FastSAM-x.pt"))
+        self.det.load(self.cfg.get("model", "FastSAM-x.pt"),
+                      self.cfg.get("model_type", "auto"))
         img = cv2.imread(path)
         if img is None:
             self.log("cannot read %s" % os.path.basename(path))
@@ -987,10 +1055,22 @@ class App:
         self._refresh_map_info()
 
         # --- Detection ---
-        self._config_row(t_det, 0, "model", "MODEL", "text")
+        self._config_row(t_det, 0, "model", "MODEL (.pt)", "openfile")
+        ttk.Label(t_det, text="Model type", width=26).grid(row=1, column=0,
+                                                           sticky=tk.W, pady=4)
+        self.model_type_var = tk.StringVar(value=self.cfg.get("model_type", "auto"))
+        ttk.Combobox(t_det, textvariable=self.model_type_var, width=14,
+                     state="readonly",
+                     values=["auto", "fastsam", "yolo", "sam"]).grid(
+            row=1, column=1, sticky=tk.W)
         for i, key in enumerate(DET_PARAMS):
-            self._config_row(t_det, i + 1, key, key.upper(), "text")
-        r0 = len(DET_PARAMS) + 1
+            self._config_row(t_det, i + 2, key, key.upper(), "text")
+        r0 = len(DET_PARAMS) + 2
+        self.subpixel_var = tk.BooleanVar(value=bool(self.cfg.get("subpixel", True)))
+        ttk.Checkbutton(t_det, text="Sub-pixel circle fit (more precise)",
+                        variable=self.subpixel_var).grid(
+            row=r0, column=1, sticky=tk.W, pady=(6, 0))
+        r0 += 1
         self.measure_inner_var = tk.BooleanVar(
             value=bool(self.cfg.get("measure_inner")))
         ttk.Checkbutton(t_det, text="Also measure inner diameter (hole)",
@@ -1219,6 +1299,8 @@ class App:
                 self.cfg[k] = float(self.vars[k].get())
             self.cfg["measure_inner"] = bool(self.measure_inner_var.get())
             self.cfg["inner_sat_thresh"] = int(self.vars["inner_sat_thresh"].get())
+            self.cfg["model_type"] = self.model_type_var.get() or "auto"
+            self.cfg["subpixel"] = bool(self.subpixel_var.get())
             self.cfg["tcp_enabled"] = bool(self.tcp_enabled_var.get())
             self.cfg["tcp_host"] = self.vars["tcp_host"].get() or "0.0.0.0"
             self.cfg["tcp_port"] = int(self.vars["tcp_port"].get())
@@ -1249,6 +1331,8 @@ class App:
         self.auto_start_var.set(bool(self.cfg.get("auto_start", True)))
         self.undistort_var.set(bool(self.cfg.get("undistort")))
         self.measure_inner_var.set(bool(self.cfg.get("measure_inner")))
+        self.model_type_var.set(self.cfg.get("model_type", "auto"))
+        self.subpixel_var.set(bool(self.cfg.get("subpixel", True)))
 
     def save(self, announce=True):
         if not self._read_fields():

@@ -34,6 +34,14 @@ ring-finder/
 pip install -r requirements.txt          # first run downloads FastSAM (~138 MB)
 ```
 
+## Better accuracy: a custom model
+
+FastSAM is generic and works out of the box, but a model trained on your
+washers is more accurate and far faster. See `training/README_train.md`:
+bootstrap labels from FastSAM (`training/pseudolabel.py`), correct them,
+train (`training/train_yolo.py`), then set MODEL = your `best.pt` and Model
+type = `yolo` in the app.
+
 ## Build a Windows .exe (ring_app)
 
 On a Windows machine with Python and the deps installed, from the project root:
@@ -93,8 +101,10 @@ tabs:
   output CSV (append log) and a **latest CSV** (overwritten each image with
   only the current readings), **XY offset (mm)**,
   **auto-delete images older than N min**, calibration (homography) file, the
-  **FastSAM detection parameters** (`model, conf, iou, min/max_area_frac,
-  min_circ, min_radius_frac`), an optional **inner-diameter (hole)**
+  the detection **model** (FastSAM, a YOLO-seg, or a custom-trained `.pt` — a
+  **Model type** selector picks the right loader) with a **sub-pixel circle
+  fit** toggle for tighter diameters, plus `conf, iou, min/max_area_frac,
+  min_circ, min_radius_frac`, an optional **inner-diameter (hole)**
   measurement (best-effort, image-based), a **TCP server** (host/port/line
   format), and
   **output ordering** (sort rings by `y`, `x`, or `diameter`, asc/desc — sets
