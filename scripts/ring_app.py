@@ -782,7 +782,33 @@ class App:
         self.logbox.pack(fill=tk.X)
 
     # ---- Configuration tab ----
-    def _build_config(self, p):
+    def _build_config(self, page):
+        # make the whole tab scrollable so the Save buttons are always reachable
+        canvas = tk.Canvas(page, highlightthickness=0)
+        vsb = ttk.Scrollbar(page, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        inner = ttk.Frame(canvas)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(win, width=e.width))
+
+        def _wheel(e):
+            canvas.yview_scroll(int(-(e.delta / 120)) or (-1 if e.delta > 0 else 1),
+                                "units")
+        canvas.bind("<Enter>", lambda e: (
+            canvas.bind_all("<MouseWheel>", _wheel),
+            canvas.bind_all("<Button-4>", lambda ev: canvas.yview_scroll(-1, "units")),
+            canvas.bind_all("<Button-5>", lambda ev: canvas.yview_scroll(1, "units"))))
+        canvas.bind("<Leave>", lambda e: (
+            canvas.unbind_all("<MouseWheel>"),
+            canvas.unbind_all("<Button-4>"),
+            canvas.unbind_all("<Button-5>")))
+
+        p = inner   # build all the config widgets inside the scrollable frame
         self.vars = {}
         general = [
             ("watch_folder", "Watch folder", "dir"),
