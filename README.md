@@ -1,42 +1,70 @@
 # ring-finder
 
-**`ring_finder.py` is the one-step production script**: it detects every ring
-and outputs each one's **robot XY (mm)** in a single run, using a built-in
-hand-eye homography (regenerate with `robot_map.py` after any camera/robot
-move, pass via `--map`).
+Detect rings on the conveyor and output each one's **robot XY (mm)** for
+pick-and-place — robust to the textured mesh background (FastSAM
+segmentation, not HoughCircles).
 
-```bash
-python ring_finder.py parts/                 # detect + robot XY
-python ring_finder.py parts/ --map robot_map.json
-python ring_finder.py parts/ --no-robot      # pixels only
+## Project structure
+
+```
+ring-finder/
+├── scripts/               # all runnable tools (keep them together)
+│   ├── ring_finder.py     #  MAIN: detect + robot XY, one run
+│   ├── watch_folder.py    #  live: watch a folder, measure each new image
+│   ├── robot_map.py       #  fit the pixel -> robot XY homography
+│   ├── ai.py              #  detection only (pixels)
+│   ├── calibrate.py       #  camera calibration from a ChArUco board
+│   ├── pixel_to_mm.py     #  single pixel -> mm helpers
+│   └── rings_to_mm.py     #  batch *_rings.json -> mm
+├── config/
+│   └── robot_map.json     # fitted pixel->robot homography (auto-loaded)
+├── data/
+│   ├── incoming/          # camera drops .bmp here  (watched)
+│   ├── calibration/       # ChArUco board photos for calibrate.py
+│   └── robot_xy.csv       # robot coords used to fit robot_map.json
+├── requirements.txt
+└── README.md
 ```
 
-Each image gets `<image>_rings.png` (annotated) and `<image>_rings.json`
-(pixel + `robot_x`/`robot_y`).
-
-### Live folder watch (`watch_folder.py`)
-
-To run continuously — the camera drops `.bmp` files into a folder and each
-new one is measured automatically:
+## Install
 
 ```bash
-python watch_folder.py ./incoming            # watch ./incoming forever
-python watch_folder.py ./incoming --map robot_map.json --poll 0.5
+pip install -r requirements.txt          # first run downloads FastSAM (~138 MB)
 ```
 
-It loads the model once, then for every **new** image writes
-`<image>_rings.png` + `<image>_rings.json` and appends a row per ring to
-`results.csv` (timestamp, image, id, pixel, robot XY). A file is processed
-only after its size stops growing, so half-written images aren't read
-early. Set the folder and options in the CONFIG block at the top (handy for
-just pressing Run in PyCharm), or pass them on the command line. `--all`
-also processes images already present at start; watches `.bmp` by default
-(edit `IMAGE_EXTS`).
+## Quick start
 
-The rest of this repo is the supporting
-toolkit: `ai.py` (detection only), `calibrate.py`/`pixel_to_mm.py`/
-`rings_to_mm.py` (camera calibration + mm), and `robot_map.py` (fit the
-pixel→robot map). See below.
+```bash
+# one folder / one image (auto-loads config/robot_map.json)
+python scripts/ring_finder.py data/incoming/
+python scripts/ring_finder.py path/to/image.bmp
+python scripts/ring_finder.py data/incoming/ --no-robot   # pixels only
+
+# live: watch data/incoming/ and measure every new .bmp automatically
+python scripts/watch_folder.py                 # uses data/incoming by default
+python scripts/watch_folder.py /some/other/dir --poll 0.5
+```
+
+Each image produces `<image>_rings.png` (annotated) and `<image>_rings.json`
+(pixel + `robot_x`/`robot_y`); the watcher also appends a timestamped row per
+ring to `results.csv`. Paths are anchored to the project root, so it works
+whether you Run from PyCharm or the command line. A file is processed only
+after its size stops growing, so half-written images aren't read early.
+
+## Recalibrate after any camera or robot move
+
+```bash
+# 1. jog the robot to a few rings, record id,x,y in data/robot_xy.csv
+# 2. capture one image per ring (1.bmp, 2.bmp, ...) and detect them
+python scripts/ai.py calib_shots/
+# 3. fit the new map
+python scripts/robot_map.py fit --rings calib_shots/ --robot data/robot_xy.csv \
+       --out config/robot_map.json
+```
+
+`fit` prints an in-fit and a leave-one-out RMS, and RANSAC-flags any point
+whose recorded robot XY doesn't fit. `ring_finder.py`/`watch_folder.py`
+pick up `config/robot_map.json` automatically on the next run.
 
 ---
 

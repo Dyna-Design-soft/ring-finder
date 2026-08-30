@@ -1,16 +1,31 @@
-# calibration / detection outputs
+# runtime outputs (kept out of git)
+data/incoming/*_rings.png
+data/incoming/*_rings.json
+data/incoming/results.csv
+**/results.csv
+*_ai_rings.png
+*_rings.png
+*_rings.json
+
+# calibration outputs
 calibration.json
 calibration.npz
 plane_map.json
+tilt_check.png
 undistorted/
-*_ai_rings.png
-*_rings.json
 
 # python
 __pycache__/
 *.pyc
 .venv/
 venv/
+.idea/
 
-# model weights (auto-downloaded)
+# model weights (auto-downloaded on first run)
 FastSAM-*.pt
+
+# but keep placeholder + doc files in the data folders
+!data/incoming/.gitkeep
+!data/incoming/README.txt
+!data/calibration/.gitkeep
+!data/calibration/README.txt

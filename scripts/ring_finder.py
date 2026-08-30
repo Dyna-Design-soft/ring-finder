@@ -58,6 +58,10 @@ DEFAULT_ROBOT_H = [
 
 _model = None
 
+# project root = folder above this scripts/ dir
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_MAP_FILE = os.path.join(ROOT, "config", "robot_map.json")
+
 
 def get_model():
     global _model
@@ -67,6 +71,9 @@ def get_model():
 
 
 def load_homography(map_path):
+    # explicit path wins; else config/robot_map.json; else the built-in map
+    if map_path is None and os.path.exists(DEFAULT_MAP_FILE):
+        map_path = DEFAULT_MAP_FILE
     if map_path is None:
         return np.array(DEFAULT_ROBOT_H, dtype=np.float64)
     return np.array(json.load(open(map_path))["H"], dtype=np.float64)

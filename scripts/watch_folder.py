@@ -26,9 +26,12 @@ import argparse
 
 import ring_finder as rf   # reuse the detector + robot map from ring_finder.py
 
+# project root = folder above this scripts/ dir
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 # -------- CONFIG (edit these, or override on the command line) --------
-WATCH_DIR     = "./incoming"     # folder the camera drops images into
-ROBOT_MAP     = None             # path to robot_map.json, or None = built-in map
+WATCH_DIR     = os.path.join(ROOT, "data", "incoming")  # camera drops images here
+ROBOT_MAP     = None             # path to robot_map.json, or None = config/robot_map.json
 RESULTS_CSV   = "results.csv"    # running log (created inside WATCH_DIR)
 POLL_SECONDS  = 1.0              # how often to scan the folder
 IMAGE_EXTS    = (".bmp",)         # file types to watch for (camera writes .bmp)
