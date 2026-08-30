@@ -164,6 +164,28 @@ python rings_to_mm.py calibration.json parts/ --frame-mm 200 150 --origin toplef
 `--frame-mm` assumes the camera looks straight at a flat belt (uniform
 mm/px); the calibration is still used to undistort each point first.
 
+## Pixel → robot XY for pick-and-place (`robot_map.py`)
+
+If a robot picks the rings, map the pixel straight to the robot's XY frame.
+The camera views a flat plane, so one homography does it — no intrinsics
+file needed (it absorbs scale, perspective and the tiny distortion).
+
+Calibrate once from a few rings whose robot XY you jogged to and recorded
+(one ring per numbered image, `1.bmp`, `2.bmp`, …; `robot_xy.csv` is
+`id,x,y`), then apply to every new detection:
+
+```bash
+python ai.py calib_shots/                 # detect -> <id>_rings.json
+python robot_map.py fit --rings calib_shots/ --robot robot_xy.csv --out robot_map.json
+python robot_map.py apply robot_map.json --rings newparts/   # adds robot_x/y
+python robot_map.py apply robot_map.json --u 210 --v 128     # one pixel
+```
+
+`fit` reports the in-fit RMS **and a leave-one-out RMS** (the honest error
+on an unseen ring), and RANSAC-flags any point whose recorded robot XY
+doesn't fit — printing what the map expected, so a mistyped coordinate is
+caught instead of poisoning the whole map.
+
 ### In your own code
 
 ```python
