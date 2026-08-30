@@ -12,7 +12,28 @@ python ring_finder.py parts/ --no-robot      # pixels only
 ```
 
 Each image gets `<image>_rings.png` (annotated) and `<image>_rings.json`
-(pixel + `robot_x`/`robot_y`). The rest of this repo is the supporting
+(pixel + `robot_x`/`robot_y`).
+
+### Live folder watch (`watch_folder.py`)
+
+To run continuously — the camera drops `.bmp` files into a folder and each
+new one is measured automatically:
+
+```bash
+python watch_folder.py ./incoming            # watch ./incoming forever
+python watch_folder.py ./incoming --map robot_map.json --poll 0.5
+```
+
+It loads the model once, then for every **new** image writes
+`<image>_rings.png` + `<image>_rings.json` and appends a row per ring to
+`results.csv` (timestamp, image, id, pixel, robot XY). A file is processed
+only after its size stops growing, so half-written images aren't read
+early. Set the folder and options in the CONFIG block at the top (handy for
+just pressing Run in PyCharm), or pass them on the command line. `--all`
+also processes images already present at start; watches `.bmp` by default
+(edit `IMAGE_EXTS`).
+
+The rest of this repo is the supporting
 toolkit: `ai.py` (detection only), `calibrate.py`/`pixel_to_mm.py`/
 `rings_to_mm.py` (camera calibration + mm), and `robot_map.py` (fit the
 pixel→robot map). See below.
