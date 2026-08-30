@@ -39,7 +39,7 @@ import numpy as np
 from ultralytics import FastSAM
 
 # tkinter / Pillow imported lazily in main() so the worker stays testable.
-tk = ttk = filedialog = messagebox = Image = ImageTk = None
+tk = ttk = filedialog = messagebox = simpledialog = Image = ImageTk = None
 
 if getattr(sys, "frozen", False):
     # running as a PyInstaller .exe -> keep config/ and data/ next to the exe
@@ -58,6 +58,8 @@ DEFAULT_CONFIG = {
     "offset_x": 0.0,
     "offset_y": 0.0,
     "homography_file": os.path.join(ROOT, "config", "robot_map.json"),
+    "intrinsics_file": os.path.join(ROOT, "config", "calibration.json"),  # optional
+    "undistort": False,             # distortion-aware map (needs intrinsics_file)
     # ---- FastSAM detection parameters ----
     "model": "FastSAM-x.pt",
     "conf": 0.20,
@@ -220,20 +222,64 @@ def save_config(cfg):
     json.dump(cfg, open(CONFIG_FILE, "w"), indent=2)
 
 
-def load_homography(path):
+def load_intrinsics(path):
+    """Load camera_matrix + distortion from a calibrate.py calibration.json.
+    Returns (K, dist) or (None, None)."""
     try:
-        return np.array(json.load(open(path))["H"], dtype=np.float64)
+        d = json.load(open(path))
+        K = np.array(d["camera_matrix"], np.float64)
+        dist = np.array(d["distortion_coefficients"], np.float64)
+        return K, dist
+    except Exception:
+        return None, None
+
+
+def load_mapper(path):
+    """Load a pixel->robot map. Returns dict {H, K, dist} or None. K/dist are
+    present when the map was fitted distortion-aware (points undistorted)."""
+    try:
+        d = json.load(open(path))
+        H = np.array(d["H"], np.float64)
+        K = np.array(d["K"], np.float64) if d.get("K") else None
+        dist = np.array(d["dist"], np.float64) if d.get("dist") is not None else None
+        return {"H": H, "K": K, "dist": dist}
     except Exception:
         return None
 
 
-def fit_homography(points, ransac_mm=6.0):
+def _undistort(pts, mapper):
+    pts = np.asarray(pts, np.float64).reshape(-1, 1, 2)
+    if mapper.get("K") is not None:
+        return cv2.undistortPoints(pts, mapper["K"], mapper["dist"], P=mapper["K"])
+    return pts
+
+
+def map_point(mapper, x, y):
+    """Pixel (x, y) -> robot (X, Y) mm (undistorts first if intrinsics present)."""
+    pt = _undistort([(x, y)], mapper)
+    q = cv2.perspectiveTransform(pt, mapper["H"]).reshape(2)
+    return float(q[0]), float(q[1])
+
+
+def map_diameter_mm(mapper, x, y, r):
+    """Outer diameter in mm: map opposite rim points and average."""
+    rim = _undistort([(x + r, y), (x - r, y), (x, y + r), (x, y - r)], mapper)
+    mm = cv2.perspectiveTransform(rim, mapper["H"]).reshape(-1, 2)
+    return 0.5 * (float(np.linalg.norm(mm[0] - mm[1])) +
+                  float(np.linalg.norm(mm[2] - mm[3])))
+
+
+def fit_homography(points, ransac_mm=6.0, K=None, dist=None, frame_wh=None):
     """points = [(px, py, robot_x, robot_y), ...] -> dict with H + stats.
+    If K/dist given, the pixel points are undistorted first (distortion-aware)
+    and K/dist are embedded in the result so runtime undistorts identically.
     Raises ValueError if fewer than 4 points."""
     if len(points) < 4:
         raise ValueError("need at least 4 points, have %d" % len(points))
     P = np.array([[p[0], p[1]] for p in points], np.float64)
     R = np.array([[p[2], p[3]] for p in points], np.float64)
+    if K is not None and dist is not None:
+        P = cv2.undistortPoints(P.reshape(-1, 1, 2), K, dist, P=K).reshape(-1, 2)
     H, mask = cv2.findHomography(P, R, cv2.RANSAC, ransac_mm)
     if H is None:
         raise ValueError("homography fit failed")
@@ -244,7 +290,6 @@ def fit_homography(points, ransac_mm=6.0):
     H, _ = cv2.findHomography(Pi, Ri, 0)
     proj = cv2.perspectiveTransform(Pi.reshape(-1, 1, 2), H).reshape(-1, 2)
     res = np.linalg.norm(proj - Ri, axis=1)
-    # leave-one-out only makes sense with >=5 points
     loo = None
     if len(inl) >= 5:
         errs = []
@@ -254,17 +299,38 @@ def fit_homography(points, ransac_mm=6.0):
             q = cv2.perspectiveTransform(P[h].reshape(-1, 1, 2), Hh).reshape(2)
             errs.append(float(np.linalg.norm(q - R[h])))
         loo = float(np.sqrt(np.mean(np.square(errs))))
-    return {
+    # coverage: warn if the calibration points are nearly collinear / clustered
+    warn = None
+    Pin = np.array([[points[i][0], points[i][1]] for i in inl], np.float64)
+    c = Pin - Pin.mean(axis=0)
+    ev = np.linalg.eigvalsh(np.cov(c.T)) if len(inl) >= 2 else np.array([1.0, 1.0])
+    ratio = float(ev.min() / ev.max()) if ev.max() > 0 else 0.0
+    if ratio < 0.05:
+        warn = ("calibration points are nearly collinear - spread them across "
+                "the whole frame for a reliable map")
+    elif frame_wh:
+        xr = float(Pin[:, 0].max() - Pin[:, 0].min())
+        yr = float(Pin[:, 1].max() - Pin[:, 1].min())
+        if xr < 0.30 * frame_wh[0] or yr < 0.30 * frame_wh[1]:
+            warn = ("calibration points are clustered (cover %.0f%% x %.0f%% of "
+                    "the frame) - spread them out and toward the corners"
+                    % (100 * xr / frame_wh[0], 100 * yr / frame_wh[1]))
+    result = {
         "type": "homography_px_to_robot_mm",
         "H": H.tolist(),
         "points_used": len(inl),
         "excluded": [i + 1 for i in range(len(points)) if i not in inl],
         "rms_mm": float(np.sqrt((res ** 2).mean())),
         "loo_rms_mm": loo,
+        "coverage_warning": warn,
         "points": [{"id": i + 1, "px": p[0], "py": p[1],
                     "robot_x": p[2], "robot_y": p[3]}
                    for i, p in enumerate(points)],
     }
+    if K is not None and dist is not None:
+        result["K"] = K.tolist()
+        result["dist"] = dist.ravel().tolist()
+    return result
 
 
 # ---------------- TCP server ----------------
@@ -418,7 +484,7 @@ def sort_rings(rings, by="y", desc=False):
     return sorted(rings, key=lambda t: t[idx], reverse=bool(desc))
 
 
-def annotate(img, rings, cfg=None, H=None):
+def annotate(img, rings, cfg=None, mapper=None):
     """Draw rings; returns (vis, records)."""
     ox = float(cfg.get("offset_x", 0.0)) if cfg else 0.0
     oy = float(cfg.get("offset_y", 0.0)) if cfg else 0.0
@@ -426,14 +492,16 @@ def annotate(img, rings, cfg=None, H=None):
     recs = []
     for i, (x, y, r) in enumerate(rings):
         rec = {"id": i + 1, "x": round(x, 1), "y": round(y, 1),
-               "diameter": round(2 * r, 1), "robot_x": "", "robot_y": ""}
+               "diameter": round(2 * r, 1), "robot_x": "", "robot_y": "",
+               "diameter_mm": ""}
         label = str(i + 1)
-        if H is not None:
-            q = cv2.perspectiveTransform(
-                np.array([[x, y]], np.float64).reshape(-1, 1, 2), H).reshape(2)
-            rec["robot_x"] = round(float(q[0]) + ox, 3)
-            rec["robot_y"] = round(float(q[1]) + oy, 3)
-            label += " (%.1f,%.1f)" % (rec["robot_x"], rec["robot_y"])
+        if mapper is not None:
+            rx, ry = map_point(mapper, x, y)
+            rec["robot_x"] = round(rx + ox, 3)
+            rec["robot_y"] = round(ry + oy, 3)
+            rec["diameter_mm"] = round(map_diameter_mm(mapper, x, y, r), 3)
+            label += " (%.1f,%.1f) D%.1f" % (rec["robot_x"], rec["robot_y"],
+                                             rec["diameter_mm"])
         cv2.circle(vis, (int(x), int(y)), int(r), (0, 255, 0), 2)
         cv2.drawMarker(vis, (int(x), int(y)), (0, 0, 255), cv2.MARKER_CROSS, 18, 2)
         cv2.putText(vis, label, (int(x) - 12, int(y) - int(r) - 5),
@@ -603,14 +671,14 @@ class Worker(threading.Thread):
             detect_ms = (time.time() - t0) * 1000.0
             rings = sort_rings(rings, self.cfg.get("sort_by", "y"),
                                self.cfg.get("sort_desc", False))
-            H = load_homography(self.cfg.get("homography_file", ""))
-            vis, recs = annotate(img, rings, self.cfg, H)   # applies mm/robot XY
+            mapper = load_mapper(self.cfg.get("homography_file", ""))
+            vis, recs = annotate(img, rings, self.cfg, mapper)  # mm/robot XY + dia mm
             total_ms = (time.time() - t0) * 1000.0
             self._write_csv(name, recs)
             self._write_latest_csv(name, recs)
             self._tcp_send(name, recs)
             self.q.put(("result", {"name": name, "image": vis, "rings": recs,
-                                   "has_map": H is not None,
+                                   "has_map": mapper is not None,
                                    "empty": len(recs) == 0,
                                    "detect_ms": detect_ms,
                                    "total_ms": total_ms}))
@@ -619,7 +687,7 @@ class Worker(threading.Thread):
                 self.log("%s -> CONVEYOR EMPTY (no ring)%s" % (name, timing))
             else:
                 self.log("%s -> %d ring(s)%s%s" % (name, len(recs),
-                         "" if H is not None else "  (no homography loaded!)",
+                         "" if mapper is not None else "  (no homography loaded!)",
                          timing))
         except Exception as e:
             self.log("ERROR on %s: %s" % (name, e))
@@ -655,6 +723,7 @@ class Worker(threading.Thread):
             try:
                 lines.append(fmt.format(id=r["id"], x=r["robot_x"],
                                         y=r["robot_y"], dia=r["diameter"],
+                                        dia_mm=r.get("diameter_mm", ""),
                                         image=image))
             except Exception:
                 lines.append("%s,%s,%s" % (r["id"], r["robot_x"], r["robot_y"]))
@@ -672,11 +741,13 @@ class Worker(threading.Thread):
                 w = csv.writer(f)
                 if new:
                     w.writerow(["timestamp", "image", "ring_id", "x_px",
-                                "y_px", "diameter_px", "robot_x", "robot_y"])
+                                "y_px", "diameter_px", "robot_x", "robot_y",
+                                "diameter_mm"])
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 for r in rings:
                     w.writerow([ts, image, r["id"], r["x"], r["y"],
-                                r["diameter"], r["robot_x"], r["robot_y"]])
+                                r["diameter"], r["robot_x"], r["robot_y"],
+                                r.get("diameter_mm", "")])
         except Exception as e:
             self.log("CSV write failed: %s" % e)
 
@@ -690,11 +761,12 @@ class Worker(threading.Thread):
             with open(path, "w", newline="") as f:
                 w = csv.writer(f)
                 w.writerow(["timestamp", "image", "ring_id", "x_px", "y_px",
-                            "diameter_px", "robot_x", "robot_y"])
+                            "diameter_px", "robot_x", "robot_y", "diameter_mm"])
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 for r in rings:
                     w.writerow([ts, image, r["id"], r["x"], r["y"],
-                                r["diameter"], r["robot_x"], r["robot_y"]])
+                                r["diameter"], r["robot_x"], r["robot_y"],
+                                r.get("diameter_mm", "")])
         except Exception as e:
             self.log("latest CSV write failed: %s" % e)
 
@@ -791,9 +863,9 @@ class App:
         self.img_canvas.bind("<Button-5>", lambda e: self._zoom(-0.25))
         right = ttk.LabelFrame(mid, text="Rings (pixel + robot mm)", padding=6)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=6, pady=6)
-        cols = ("id", "x_px", "y_px", "dia_px", "robot_x", "robot_y")
+        cols = ("id", "x_px", "y_px", "dia_px", "robot_x", "robot_y", "dia_mm")
         self.tree = ttk.Treeview(right, columns=cols, show="headings", height=12)
-        for c, w in zip(cols, (34, 58, 58, 62, 92, 92)):
+        for c, w in zip(cols, (30, 54, 54, 56, 84, 84, 70)):
             self.tree.heading(c, text=c,
                               command=lambda cc=c: self._sort_tree(cc))
             self.tree.column(c, width=w, anchor=tk.CENTER)
@@ -852,6 +924,7 @@ class App:
             ("offset_y", "Offset Y (mm)", "text"),
             ("auto_delete_minutes", "Auto-delete images older than (min)", "text"),
             ("homography_file", "Calibration (homography) file", "openfile"),
+            ("intrinsics_file", "Camera intrinsics file (optional)", "openfile"),
         ]
         for i, (key, label, kind) in enumerate(general):
             self._config_row(t_general, i, key, label, kind)
@@ -960,6 +1033,22 @@ class App:
         right = ttk.LabelFrame(mid, text="Collected points", padding=6)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=6, pady=6)
 
+        # profile + distortion-aware
+        prof = ttk.Frame(right)
+        prof.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(prof, text="Profile").pack(side=tk.LEFT)
+        self.profile_var = tk.StringVar()
+        self.profile_combo = ttk.Combobox(prof, textvariable=self.profile_var,
+                                           width=20, state="readonly")
+        self.profile_combo.pack(side=tk.LEFT, padx=4)
+        self.profile_combo.bind("<<ComboboxSelected>>",
+                                lambda e: self._profile_selected())
+        ttk.Button(prof, text="Save as...",
+                   command=self.calib_save_as_profile).pack(side=tk.LEFT)
+        self.undistort_var = tk.BooleanVar(value=bool(self.cfg.get("undistort")))
+        ttk.Checkbutton(prof, text="distortion-aware",
+                        variable=self.undistort_var).pack(side=tk.RIGHT)
+
         # live robot position over TCP
         livef = ttk.Frame(right)
         livef.pack(fill=tk.X, pady=(0, 4))
@@ -1006,8 +1095,20 @@ class App:
         row3.pack(fill=tk.X)
         ttk.Button(row3, text="Fit & Save homography",
                    command=self.calib_fit).pack(side=tk.LEFT)
-        self.calib_result = ttk.Label(right, text="", foreground="#333")
+        self.calib_result = ttk.Label(right, text="", foreground="#333",
+                                      wraplength=360, justify=tk.LEFT)
         self.calib_result.pack(fill=tk.X, pady=(6, 0))
+
+        # verify: predicted (from selected ring) vs live robot position
+        vrow = ttk.Frame(right)
+        vrow.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(vrow, text="Verify (predicted vs live)",
+                   command=self.calib_verify).pack(side=tk.LEFT)
+        self.verify_lbl = ttk.Label(right, text="", foreground="#333",
+                                    wraplength=360, justify=tk.LEFT)
+        self.verify_lbl.pack(fill=tk.X, pady=(4, 0))
+
+        self._refresh_profiles()
 
     # ---- config helpers ----
     def _pick_dir(self, key):
@@ -1056,6 +1157,8 @@ class App:
             self.cfg["auto_delete_minutes"] = float(
                 self.vars["auto_delete_minutes"].get())
             self.cfg["homography_file"] = self.vars["homography_file"].get()
+            self.cfg["intrinsics_file"] = self.vars["intrinsics_file"].get()
+            self.cfg["undistort"] = bool(self.undistort_var.get())
             self.cfg["model"] = self.vars["model"].get() or "FastSAM-x.pt"
             for k in DET_PARAMS:
                 self.cfg[k] = float(self.vars[k].get())
@@ -1087,6 +1190,7 @@ class App:
         self.sort_by_var.set(self.cfg.get("sort_by", "y"))
         self.sort_desc_var.set(bool(self.cfg.get("sort_desc")))
         self.auto_start_var.set(bool(self.cfg.get("auto_start", True)))
+        self.undistort_var.set(bool(self.cfg.get("undistort")))
 
     def save(self, announce=True):
         if not self._read_fields():
@@ -1233,6 +1337,80 @@ class App:
         else:
             self.robot_reader.enabled.clear()
 
+    # ---- calibration profiles ----
+    def _profiles_dir(self):
+        d = os.path.join(ROOT, "config", "profiles")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _refresh_profiles(self):
+        d = self._profiles_dir()
+        self._profile_paths = {}
+        names = []
+        # include the currently active map even if it lives elsewhere
+        active = self.vars["homography_file"].get()
+        if active and os.path.exists(active):
+            n = os.path.basename(active)
+            self._profile_paths[n] = active
+            names.append(n)
+        for f in sorted(glob.glob(os.path.join(d, "*.json"))):
+            n = os.path.basename(f)
+            if n not in self._profile_paths:
+                self._profile_paths[n] = f
+                names.append(n)
+        self.profile_combo["values"] = names
+        cur = os.path.basename(active) if active else ""
+        if cur in names:
+            self.profile_var.set(cur)
+
+    def _profile_selected(self):
+        name = self.profile_var.get()
+        path = self._profile_paths.get(name)
+        if not path:
+            return
+        self.vars["homography_file"].set(path)
+        self.cfg["homography_file"] = path
+        save_config(self.cfg)
+        self._refresh_map_info()
+        self._log("active calibration profile: %s" % name)
+
+    def calib_save_as_profile(self):
+        name = simpledialog.askstring("Save profile",
+                                      "Profile name (e.g. cam1_fixtureA):")
+        if not name:
+            return
+        name = name if name.lower().endswith(".json") else name + ".json"
+        path = os.path.join(self._profiles_dir(), name)
+        self.vars["homography_file"].set(path)   # calib_fit saves to this path
+        self.calib_fit()
+        self._refresh_profiles()
+
+    def calib_verify(self):
+        ring = self._selected_ring()
+        if ring is None:
+            self.verify_lbl.config(text="grab/load an image with a ring first",
+                                   foreground="#b26b00")
+            return
+        mapper = load_mapper(self.vars["homography_file"].get())
+        if mapper is None:
+            self.verify_lbl.config(text="no valid homography loaded",
+                                   foreground="#cf222e")
+            return
+        px, py, _ = ring
+        prx, pry = map_point(mapper, px, py)     # predicted robot XY (no offset)
+        live = self.robot_reader.get_latest()
+        if live is None:
+            self.verify_lbl.config(
+                text="predicted (%.2f, %.2f) mm  |  no live robot position "
+                     "(enable 'Read robot position')" % (prx, pry),
+                foreground="#b26b00")
+            return
+        err = ((prx - live[0]) ** 2 + (pry - live[1]) ** 2) ** 0.5
+        self.verify_lbl.config(
+            text="predicted (%.2f, %.2f)  |  live (%.2f, %.2f)  |  error %.2f mm"
+                 % (prx, pry, live[0], live[1], err),
+            foreground="#1a7f37" if err < 3 else "#cf222e")
+
     def calib_update_from_live(self):
         latest = self.robot_reader.get_latest()
         if latest is None:
@@ -1283,8 +1461,21 @@ class App:
             foreground="#1a7f37" if n >= 4 else "#b26b00")
 
     def calib_fit(self):
+        # distortion-aware if enabled and intrinsics available
+        K = dist = None
+        note = ""
+        if self.undistort_var.get():
+            K, dist = load_intrinsics(self.vars["intrinsics_file"].get())
+            if K is None:
+                messagebox.showwarning(
+                    "No intrinsics",
+                    "Distortion-aware is on but the intrinsics file is missing/"
+                    "invalid.\nFitting without undistortion.")
+            else:
+                note = "  (distortion-aware)"
         try:
-            result = fit_homography(self.points)
+            result = fit_homography(self.points, K=K, dist=dist,
+                                    frame_wh=getattr(self, "_calib_wh", None))
         except ValueError as e:
             messagebox.showerror("Cannot fit", str(e))
             return
@@ -1296,13 +1487,16 @@ class App:
             messagebox.showerror("Save failed", str(e))
             return
         loo = ("%.2f" % result["loo_rms_mm"]) if result["loo_rms_mm"] else "n/a"
-        msg = ("Saved %s\npoints used: %d   fit RMS: %.2f mm   LOO: %s mm"
-               % (os.path.basename(path), result["points_used"],
+        msg = ("Saved %s%s\npoints used: %d   fit RMS: %.2f mm   LOO: %s mm"
+               % (os.path.basename(path), note, result["points_used"],
                   result["rms_mm"], loo))
         if result["excluded"]:
             msg += "\nexcluded (check robot XY): %s" % result["excluded"]
+        if result.get("coverage_warning"):
+            msg += "\n[!] " + result["coverage_warning"]
         self.calib_result.config(text=msg, foreground="#1a7f37")
         self._refresh_map_info()
+        self._refresh_profiles()
         messagebox.showinfo("Homography saved", msg)
 
     def on_close(self):
@@ -1433,10 +1627,12 @@ class App:
         for r in res["rings"]:
             self.tree.insert("", tk.END, values=(
                 r["id"], r["x"], r["y"], r["diameter"],
-                r["robot_x"], r["robot_y"]))
+                r["robot_x"], r["robot_y"], r.get("diameter_mm", "")))
 
     def _show_calib(self, res):
         self._calib_rings = res["rings"]
+        h, w = res["image"].shape[:2]
+        self._calib_wh = (w, h)
         try:
             self._calib_imgtk = self._to_tk(res["image"], (520, 430))
             self.calib_canvas.config(image=self._calib_imgtk)
@@ -1453,9 +1649,9 @@ class App:
 
 
 def main():
-    global tk, ttk, filedialog, messagebox, Image, ImageTk
+    global tk, ttk, filedialog, messagebox, simpledialog, Image, ImageTk
     import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
+    from tkinter import ttk, filedialog, messagebox, simpledialog
     from PIL import Image, ImageTk
     root = tk.Tk()
     App(root)
