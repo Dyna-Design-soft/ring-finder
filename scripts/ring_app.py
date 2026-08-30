@@ -22,6 +22,7 @@
 # ============================================================
 
 import os
+import sys
 import csv
 import glob
 import json
@@ -624,6 +625,10 @@ class App:
         btns.pack(fill=tk.X)
         ttk.Button(btns, text="Save settings", command=self.save).pack(
             side=tk.LEFT)
+        ttk.Button(btns, text="Save & Restart",
+                   command=self.save_and_restart).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Restart app",
+                   command=self.restart_app).pack(side=tk.LEFT)
         ttk.Button(btns, text="Reload calibration",
                    command=self._refresh_map_info).pack(side=tk.LEFT, padx=8)
         ttk.Label(btns, text="Robot XY = homography(pixel) + (offset X, offset Y). "
@@ -738,7 +743,7 @@ class App:
             self.map_info.config(text="calibration file not found / invalid",
                                  foreground="#cf222e")
 
-    def save(self):
+    def save(self, announce=True):
         try:
             self.cfg["watch_folder"] = self.vars["watch_folder"].get()
             self.cfg["image_ext"] = self.vars["image_ext"].get() or ".bmp"
@@ -761,11 +766,33 @@ class App:
             messagebox.showerror("Invalid value",
                                  "Numbers required for poll/offset/detection "
                                  "params and TCP port.\n%s" % e)
-            return
+            return False
         save_config(self.cfg)
         self._refresh_map_info()
         self._apply_tcp()
-        messagebox.showinfo("Saved", "Settings saved to\n%s" % CONFIG_FILE)
+        if announce:
+            messagebox.showinfo("Saved", "Settings saved to\n%s" % CONFIG_FILE)
+        return True
+
+    def save_and_restart(self):
+        if self.save(announce=False):
+            self.restart_app(confirm=False)
+
+    def restart_app(self, confirm=True):
+        if confirm and not messagebox.askyesno(
+                "Restart", "Restart the application now?"):
+            return
+        try:
+            self.worker.stop_flag.set()
+            self.tcp.stop()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        # re-launch this same program (fresh process -> model reloads, etc.)
+        os.execl(sys.executable, sys.executable, *sys.argv)
 
     def _apply_tcp(self):
         if self.cfg.get("tcp_enabled"):
