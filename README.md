@@ -51,9 +51,10 @@ background thread, so the window stays responsive.
 A self-contained operator app (independent of the other scripts) with three
 tabs:
 
-- **Live** — Start/Stop watching, annotated image, results table, log, and a
-  live **TCP connection status** (listening / number of connected clients).
-  Click a table column header to re-sort the view.
+- **Live** — Start/Stop watching, annotated image (**zoomable**: +/-, Fit,
+  100%, mouse wheel; scrollbars when enlarged), results table, log, a live
+  **TCP connection status**, and a banner that turns red **CONVEYOR EMPTY**
+  when no ring is found. Click a table column header to re-sort the view.
 - **Configuration** — all settings, saved to `config/app_config.json`:
   watch folder, image extension, **filename pattern (glob)**, poll time,
   output CSV, **XY offset (mm)**,
@@ -86,7 +87,9 @@ Behaviour notes:
   first).
 - **TCP server**: enable it and the robot connects as a client; each detection
   is sent as `{id},{x},{y}` lines (format configurable with
-  `{id} {x} {y} {dia} {image}`).
+  `{id} {x} {y} {dia} {image}`). When no ring is found, the configurable
+  **empty message** (default `EMPTY`) is sent instead, so the controller knows
+  the conveyor is empty.
 - **Robot XY = homography(pixel) + (offset_x, offset_y)**; written to the CSV
   and broadcast over TCP.
 

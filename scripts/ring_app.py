@@ -65,6 +65,7 @@ DEFAULT_CONFIG = {
     "tcp_host": "0.0.0.0",
     "tcp_port": 5000,
     "tcp_format": "{id},{x},{y}",   # one line per ring; \n appended
+    "tcp_empty_message": "EMPTY",   # sent when no ring is found (blank = off)
     # ---- watcher housekeeping ----
     "auto_delete_minutes": 10,      # delete images older than this (0 = off)
     # ---- output ordering ----
@@ -477,9 +478,13 @@ class Worker(threading.Thread):
             self._write_csv(name, recs)
             self._tcp_send(name, recs)
             self.q.put(("result", {"name": name, "image": vis, "rings": recs,
-                                   "has_map": H is not None}))
-            self.log("%s -> %d ring(s)%s" % (name, len(recs),
-                     "" if H is not None else "  (no homography loaded!)"))
+                                   "has_map": H is not None,
+                                   "empty": len(recs) == 0}))
+            if not recs:
+                self.log("%s -> CONVEYOR EMPTY (no ring)" % name)
+            else:
+                self.log("%s -> %d ring(s)%s" % (name, len(recs),
+                         "" if H is not None else "  (no homography loaded!)"))
         except Exception as e:
             self.log("ERROR on %s: %s" % (name, e))
 
@@ -500,6 +505,11 @@ class Worker(threading.Thread):
 
     def _tcp_send(self, image, rings):
         if not self.tcp:
+            return
+        if not rings:                    # conveyor empty -> send the empty signal
+            msg = self.cfg.get("tcp_empty_message", "EMPTY")
+            if msg:
+                self.tcp.broadcast(msg + "\n")
             return
         fmt = self.cfg.get("tcp_format", "{id},{x},{y}")
         lines = []
@@ -593,8 +603,34 @@ class App:
         mid.pack(fill=tk.BOTH, expand=True)
         left = ttk.LabelFrame(mid, text="Latest image", padding=6)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=6, pady=6)
-        self.canvas = tk.Label(left, background="#222")
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.banner = tk.Label(left, text="waiting...", font=("TkDefaultFont", 13, "bold"),
+                               fg="white", bg="#666")
+        self.banner.pack(fill=tk.X)
+        zc = ttk.Frame(left)
+        zc.pack(fill=tk.X, pady=2)
+        ttk.Button(zc, text="-", width=3, command=lambda: self._zoom(-0.25)).pack(side=tk.LEFT)
+        ttk.Button(zc, text="+", width=3, command=lambda: self._zoom(0.25)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(zc, text="Fit", command=self._zoom_fit).pack(side=tk.LEFT)
+        ttk.Button(zc, text="100%", command=lambda: self._zoom_set(1.0)).pack(side=tk.LEFT, padx=2)
+        self.zoom_lbl = ttk.Label(zc, text="200%")
+        self.zoom_lbl.pack(side=tk.LEFT, padx=6)
+        cvf = ttk.Frame(left)
+        cvf.pack(fill=tk.BOTH, expand=True)
+        self.img_canvas = tk.Canvas(cvf, background="#222", highlightthickness=0)
+        vsb = ttk.Scrollbar(cvf, orient=tk.VERTICAL, command=self.img_canvas.yview)
+        hsb = ttk.Scrollbar(cvf, orient=tk.HORIZONTAL, command=self.img_canvas.xview)
+        self.img_canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        self.img_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._img_item = self.img_canvas.create_image(0, 0, anchor=tk.NW)
+        self.zoom = 2.0
+        self._last_bgr = None
+        # mouse wheel zoom (Windows/Mac: <MouseWheel>; Linux: Button-4/5)
+        self.img_canvas.bind("<MouseWheel>",
+                             lambda e: self._zoom(0.25 if e.delta > 0 else -0.25))
+        self.img_canvas.bind("<Button-4>", lambda e: self._zoom(0.25))
+        self.img_canvas.bind("<Button-5>", lambda e: self._zoom(-0.25))
         right = ttk.LabelFrame(mid, text="Rings (pixel + robot mm)", padding=6)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=6, pady=6)
         cols = ("id", "x_px", "y_px", "dia_px", "robot_x", "robot_y")
@@ -671,11 +707,14 @@ class App:
         self._config_row(tcp, 1, "tcp_host", "Host / bind address", "text")
         self._config_row(tcp, 2, "tcp_port", "Port", "text")
         self._config_row(tcp, 3, "tcp_format", "Line format", "text")
-        ttk.Label(tcp, text="Placeholders: {id} {x} {y} {dia} {image}. "
-                            "One line per ring; newline appended.",
-                  foreground="#777").grid(row=4, column=1, sticky=tk.W)
+        self._config_row(tcp, 4, "tcp_empty_message",
+                         "Empty message (no ring)", "text")
+        ttk.Label(tcp, text="Placeholders: {id} {x} {y} {dia} {image}. One line "
+                            "per ring. Empty message sent when nothing is found "
+                            "(blank = send nothing).",
+                  foreground="#777").grid(row=5, column=1, sticky=tk.W)
         self.tcp_info = ttk.Label(tcp, text="", foreground="#555")
-        self.tcp_info.grid(row=5, column=1, sticky=tk.W, pady=(2, 0))
+        self.tcp_info.grid(row=6, column=1, sticky=tk.W, pady=(2, 0))
 
         btns = ttk.Frame(p, padding=(10, 4))
         btns.pack(fill=tk.X)
@@ -822,6 +861,7 @@ class App:
             self.cfg["tcp_host"] = self.vars["tcp_host"].get() or "0.0.0.0"
             self.cfg["tcp_port"] = int(self.vars["tcp_port"].get())
             self.cfg["tcp_format"] = self.vars["tcp_format"].get() or "{id},{x},{y}"
+            self.cfg["tcp_empty_message"] = self.vars["tcp_empty_message"].get()
             self.cfg["sort_by"] = self.sort_by_var.get() or "y"
             self.cfg["sort_desc"] = bool(self.sort_desc_var.get())
         except ValueError as e:
@@ -1099,12 +1139,48 @@ class App:
         im.thumbnail(box)
         return ImageTk.PhotoImage(im)
 
-    def _show(self, res):
+    def _zoom(self, delta):
+        self.zoom = max(0.25, min(8.0, self.zoom + delta))
+        self._render_live()
+
+    def _zoom_set(self, z):
+        self.zoom = z
+        self._render_live()
+
+    def _zoom_fit(self):
+        if self._last_bgr is None:
+            return
+        h, w = self._last_bgr.shape[:2]
+        cw = self.img_canvas.winfo_width() or 560
+        ch = self.img_canvas.winfo_height() or 460
+        self.zoom = max(0.1, min(cw / w, ch / h))
+        self._render_live()
+
+    def _render_live(self):
+        if self._last_bgr is None:
+            return
+        h, w = self._last_bgr.shape[:2]
+        nw, nh = max(1, int(w * self.zoom)), max(1, int(h * self.zoom))
         try:
-            self._imgtk = self._to_tk(res["image"], (560, 470))
-            self.canvas.config(image=self._imgtk)
+            rgb = cv2.cvtColor(self._last_bgr, cv2.COLOR_BGR2RGB)
+            im = Image.fromarray(rgb).resize((nw, nh))
+            self._imgtk = ImageTk.PhotoImage(im)
+            self.img_canvas.itemconfig(self._img_item, image=self._imgtk)
+            self.img_canvas.configure(scrollregion=(0, 0, nw, nh))
+            self.zoom_lbl.config(text="%d%%" % int(self.zoom * 100))
         except Exception as e:
             self._log("display error: %s" % e)
+
+    def _show(self, res):
+        if res.get("empty"):
+            self.banner.config(text="CONVEYOR EMPTY  -  %s" % res["name"],
+                               bg="#cf222e")
+        else:
+            self.banner.config(text="%d ring(s)  -  %s"
+                                    % (len(res["rings"]), res["name"]),
+                               bg="#1a7f37")
+        self._last_bgr = res["image"]
+        self._render_live()
         for row in self.tree.get_children():
             self.tree.delete(row)
         for r in res["rings"]:
