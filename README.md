@@ -47,8 +47,18 @@ build_exe.bat
 target PC. When frozen, the app keeps `config\` and `data\` **next to the
 exe**, so settings (`config\app_config.json`) and results persist and stay
 editable. The FastSAM weight isn't bundled: on first run it downloads, or drop
-`FastSAM-x.pt` beside the exe. Set `console=True` in `ring_app.spec` if you
-need to see errors while getting the first build working.
+`FastSAM-x.pt` beside the exe.
+
+**Run `dist\ring_app\ring_app.exe`, not the copy under `build\`** (`build\`
+is only PyInstaller's scratch folder). Keep the exe next to its `_internal\`
+folder. `ring_app.spec` ships with `console=True` so a terminal shows any
+startup error on the first build; flip it to `False` for the final windowed
+build once it runs.
+
+**"Failed to load Python DLL python3xx.dll — the specified module could not
+be found"** means the target PC is missing the Microsoft Visual C++
+Redistributable (x64) — install it and retry:
+https://aka.ms/vs/17/release/vc_redist.x64.exe
 
 ## Quick start — GUI (easiest)
 

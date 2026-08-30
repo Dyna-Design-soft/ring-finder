@@ -55,7 +55,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name="ring_app",
-    console=False,          # set True to see a console with errors while debugging
+    console=True,           # keep True until the first build runs; flip to False after
     icon=None,
 )
 coll = COLLECT(
