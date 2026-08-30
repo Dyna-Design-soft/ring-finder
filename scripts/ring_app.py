@@ -28,6 +28,7 @@ import json
 import time
 import queue
 import socket
+import fnmatch
 import threading
 
 import cv2
@@ -43,6 +44,7 @@ CONFIG_FILE = os.path.join(ROOT, "config", "app_config.json")
 DEFAULT_CONFIG = {
     "watch_folder": os.path.join(ROOT, "data", "incoming"),
     "image_ext": ".bmp",
+    "name_pattern": "*",        # glob on filename; "*" = any, e.g. "202*_*.bmp"
     "poll_seconds": 0.5,
     "output_csv": os.path.join(ROOT, "data", "results.csv"),
     "offset_x": 0.0,
@@ -348,7 +350,10 @@ class Worker(threading.Thread):
     def _is_img(self, n):
         ext = self.cfg.get("image_ext", ".bmp").lower()
         low = n.lower()
-        return low.endswith(ext) and not low.endswith("_rings.png")
+        if not low.endswith(ext) or low.endswith("_rings.png"):
+            return False
+        pattern = (self.cfg.get("name_pattern") or "*").strip()
+        return fnmatch.fnmatch(low, pattern.lower())
 
     def _scan(self):
         folder = self.cfg["watch_folder"]
@@ -574,6 +579,7 @@ class App:
         general = [
             ("watch_folder", "Watch folder", "dir"),
             ("image_ext", "Image extension", "text"),
+            ("name_pattern", "Filename pattern (glob)", "text"),
             ("poll_seconds", "Poll time (seconds)", "text"),
             ("output_csv", "Output CSV file", "savefile"),
             ("offset_x", "Offset X (mm)", "text"),
@@ -736,6 +742,7 @@ class App:
         try:
             self.cfg["watch_folder"] = self.vars["watch_folder"].get()
             self.cfg["image_ext"] = self.vars["image_ext"].get() or ".bmp"
+            self.cfg["name_pattern"] = self.vars["name_pattern"].get() or "*"
             self.cfg["poll_seconds"] = float(self.vars["poll_seconds"].get())
             self.cfg["output_csv"] = self.vars["output_csv"].get()
             self.cfg["offset_x"] = float(self.vars["offset_x"].get())
@@ -797,8 +804,10 @@ class App:
     def calib_grab(self):
         folder = self.cfg.get("watch_folder", "")
         ext = self.cfg.get("image_ext", ".bmp")
+        pattern = (self.cfg.get("name_pattern") or "*").lower()
         files = [f for f in glob.glob(os.path.join(folder, "*" + ext))
-                 if not f.endswith("_rings.png")]
+                 if not f.lower().endswith("_rings.png")
+                 and fnmatch.fnmatch(os.path.basename(f).lower(), pattern)]
         if not files:
             messagebox.showwarning("No image",
                                    "No %s image found in\n%s" % (ext, folder))

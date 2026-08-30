@@ -53,7 +53,8 @@ tabs:
 
 - **Live** — Start/Stop watching, annotated image, results table, log.
 - **Configuration** — all settings, saved to `config/app_config.json`:
-  watch folder, image extension, poll time, output CSV, **XY offset (mm)**,
+  watch folder, image extension, **filename pattern (glob)**, poll time,
+  output CSV, **XY offset (mm)**,
   **auto-delete images older than N min**, calibration (homography) file, the
   **FastSAM detection parameters** (`model, conf, iou, min/max_area_frac,
   min_circ, min_radius_frac`), and a **TCP server** (host/port/line format).
@@ -68,6 +69,9 @@ python scripts/ring_app.py
 ```
 
 Behaviour notes:
+- **Filename pattern** (glob) limits which files are processed:
+  `*` = any image; `202*_*.bmp` or `????????_??????.bmp` = only timestamp
+  names like `20260830_154619.bmp`; or an exact name like `image.bmp`.
 - **Watcher re-fires on a changed file too**, not only new names — so a camera
   that overwrites one fixed filename still triggers each frame (detects new
   name **or** changed modification time; waits for the file to stop changing
