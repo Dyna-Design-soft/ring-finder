@@ -1,0 +1,15 @@
+# calibration / detection outputs
+calibration.json
+calibration.npz
+undistorted/
+*_ai_rings.png
+*_rings.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# model weights (auto-downloaded)
+FastSAM-*.pt
