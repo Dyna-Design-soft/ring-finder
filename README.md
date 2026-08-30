@@ -1,4 +1,25 @@
-# ring-finder — camera calibration
+# ring-finder
+
+**`ring_finder.py` is the one-step production script**: it detects every ring
+and outputs each one's **robot XY (mm)** in a single run, using a built-in
+hand-eye homography (regenerate with `robot_map.py` after any camera/robot
+move, pass via `--map`).
+
+```bash
+python ring_finder.py parts/                 # detect + robot XY
+python ring_finder.py parts/ --map robot_map.json
+python ring_finder.py parts/ --no-robot      # pixels only
+```
+
+Each image gets `<image>_rings.png` (annotated) and `<image>_rings.json`
+(pixel + `robot_x`/`robot_y`). The rest of this repo is the supporting
+toolkit: `ai.py` (detection only), `calibrate.py`/`pixel_to_mm.py`/
+`rings_to_mm.py` (camera calibration + mm), and `robot_map.py` (fit the
+pixel→robot map). See below.
+
+---
+
+## camera calibration
 
 `calibrate.py` computes a camera's **intrinsics** (focal length + the true
 optical centre) and **lens-distortion** coefficients from photos of a ChArUco
