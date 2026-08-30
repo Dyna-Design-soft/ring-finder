@@ -9,8 +9,10 @@ segmentation, not HoughCircles).
 ```
 ring-finder/
 ├── scripts/               # all runnable tools (keep them together)
-│   ├── ring_finder.py     #  MAIN: detect + robot XY, one run
-│   ├── watch_folder.py    #  live: watch a folder, measure each new image
+│   ├── gui.py             #  GUI: watch folder, live image + results table
+│   ├── ringworker.py      #  background detection worker used by the GUI
+│   ├── ring_finder.py     #  MAIN (CLI): detect + robot XY, one run
+│   ├── watch_folder.py    #  live CLI: watch a folder, measure each new image
 │   ├── robot_map.py       #  fit the pixel -> robot XY homography
 │   ├── ai.py              #  detection only (pixels)
 │   ├── calibrate.py       #  camera calibration from a ChArUco board
@@ -32,7 +34,19 @@ ring-finder/
 pip install -r requirements.txt          # first run downloads FastSAM (~138 MB)
 ```
 
-## Quick start
+## Quick start — GUI (easiest)
+
+```bash
+python scripts/gui.py            # or open scripts/gui.py in PyCharm and press Run
+```
+
+The window: set the **Watch folder** (defaults to `data/incoming/`), press
+**Start**, and every new `.bmp` the camera drops in is detected and shown
+with its ring(s) circled, a results table (pixel + robot XY), and a log.
+**Open image...** runs a single file on demand. The model loads once on a
+background thread, so the window stays responsive.
+
+## Quick start — command line
 
 ```bash
 # one folder / one image (auto-loads config/robot_map.json)
