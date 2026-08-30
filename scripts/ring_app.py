@@ -590,23 +590,30 @@ class Worker(threading.Thread):
     def _process(self, path):
         name = os.path.basename(path)
         try:
+            t0 = time.time()
             img, rings = self._detect(path)
             if img is None:
                 return
+            detect_ms = (time.time() - t0) * 1000.0
             rings = sort_rings(rings, self.cfg.get("sort_by", "y"),
                                self.cfg.get("sort_desc", False))
             H = load_homography(self.cfg.get("homography_file", ""))
-            vis, recs = annotate(img, rings, self.cfg, H)
+            vis, recs = annotate(img, rings, self.cfg, H)   # applies mm/robot XY
+            total_ms = (time.time() - t0) * 1000.0
             self._write_csv(name, recs)
             self._tcp_send(name, recs)
             self.q.put(("result", {"name": name, "image": vis, "rings": recs,
                                    "has_map": H is not None,
-                                   "empty": len(recs) == 0}))
+                                   "empty": len(recs) == 0,
+                                   "detect_ms": detect_ms,
+                                   "total_ms": total_ms}))
+            timing = "  [detect %.0f ms, total %.0f ms]" % (detect_ms, total_ms)
             if not recs:
-                self.log("%s -> CONVEYOR EMPTY (no ring)" % name)
+                self.log("%s -> CONVEYOR EMPTY (no ring)%s" % (name, timing))
             else:
-                self.log("%s -> %d ring(s)%s" % (name, len(recs),
-                         "" if H is not None else "  (no homography loaded!)"))
+                self.log("%s -> %d ring(s)%s%s" % (name, len(recs),
+                         "" if H is not None else "  (no homography loaded!)",
+                         timing))
         except Exception as e:
             self.log("ERROR on %s: %s" % (name, e))
 
@@ -738,6 +745,8 @@ class App:
         ttk.Button(zc, text="100%", command=lambda: self._zoom_set(1.0)).pack(side=tk.LEFT, padx=2)
         self.zoom_lbl = ttk.Label(zc, text="200%")
         self.zoom_lbl.pack(side=tk.LEFT, padx=6)
+        self.timing_lbl = ttk.Label(zc, text="", foreground="#555")
+        self.timing_lbl.pack(side=tk.RIGHT)
         cvf = ttk.Frame(left)
         cvf.pack(fill=tk.BOTH, expand=True)
         self.img_canvas = tk.Canvas(cvf, background="#222", highlightthickness=0)
@@ -1367,6 +1376,10 @@ class App:
             self.banner.config(text="%d ring(s)  -  %s"
                                     % (len(res["rings"]), res["name"]),
                                bg="#1a7f37")
+        if "total_ms" in res:
+            self.timing_lbl.config(
+                text="detect %.0f ms | total %.0f ms"
+                     % (res.get("detect_ms", 0), res["total_ms"]))
         self._last_bgr = res["image"]
         self._render_live()
         for row in self.tree.get_children():

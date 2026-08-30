@@ -54,7 +54,12 @@ tabs:
 - **Live** — Start/Stop watching, annotated image (**zoomable**: +/-, Fit,
   100%, mouse wheel; scrollbars when enlarged), results table, log, a live
   **TCP connection status**, and a banner that turns red **CONVEYOR EMPTY**
-  when no ring is found. Click a table column header to re-sort the view.
+  when no ring is found. Shows the **processing time** per image (detection
+  ms and total ms). Click a table column header to re-sort the view.
+
+  > Timing note: on CPU, `FastSAM-x` is ~2–3 s per image; the mm/robot
+  > mapping is <1 ms. For faster cycles set `MODEL = FastSAM-s.pt` in
+  > Configuration (lighter/faster) or run on a CUDA GPU.
 - **Configuration** — all settings, saved to `config/app_config.json`:
   watch folder, image extension, **filename pattern (glob)**, poll time,
   output CSV, **XY offset (mm)**,
