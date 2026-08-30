@@ -154,7 +154,15 @@ python rings_to_mm.py calibration.json parts/ --Z 300
 # calibrate the scale from one ring whose true outer diameter you know
 python rings_to_mm.py calibration.json parts/ \
        --ref-mm 24 --ref-json parts/first_rings.json --ref-id 1
+
+# measured field of view: the real WIDTH x HEIGHT (mm) the image covers
+# at the belt surface (origin defaults to image centre)
+python rings_to_mm.py calibration.json parts/ --frame-mm 200 150
+python rings_to_mm.py calibration.json parts/ --frame-mm 200 150 --origin topleft
 ```
+
+`--frame-mm` assumes the camera looks straight at a flat belt (uniform
+mm/px); the calibration is still used to undistort each point first.
 
 ### In your own code
 
