@@ -51,13 +51,17 @@ background thread, so the window stays responsive.
 A self-contained operator app (independent of the other scripts) with three
 tabs:
 
-- **Live** — Start/Stop watching, annotated image, results table, log.
+- **Live** — Start/Stop watching, annotated image, results table, log, and a
+  live **TCP connection status** (listening / number of connected clients).
+  Click a table column header to re-sort the view.
 - **Configuration** — all settings, saved to `config/app_config.json`:
   watch folder, image extension, **filename pattern (glob)**, poll time,
   output CSV, **XY offset (mm)**,
   **auto-delete images older than N min**, calibration (homography) file, the
   **FastSAM detection parameters** (`model, conf, iou, min/max_area_frac,
-  min_circ, min_radius_frac`), and a **TCP server** (host/port/line format).
+  min_circ, min_radius_frac`), a **TCP server** (host/port/line format), and
+  **output ordering** (sort rings by `y`, `x`, or `diameter`, asc/desc — sets
+  the ring-id order used in the table, CSV and TCP).
 - **Calibration** — build the pixel→robot homography in-app: **Grab latest
   from folder** or **Load image…** → the ring pixel is detected → type the
   **Robot X/Y** for that ring → **Add point**; collect ≥4 points, then

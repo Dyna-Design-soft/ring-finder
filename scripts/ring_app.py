@@ -29,6 +29,7 @@ import json
 import time
 import queue
 import socket
+import select
 import fnmatch
 import threading
 
@@ -66,6 +67,9 @@ DEFAULT_CONFIG = {
     "tcp_format": "{id},{x},{y}",   # one line per ring; \n appended
     # ---- watcher housekeeping ----
     "auto_delete_minutes": 10,      # delete images older than this (0 = off)
+    # ---- output ordering ----
+    "sort_by": "y",                 # y | x | diameter  (order of ring ids/CSV/TCP)
+    "sort_desc": False,
 }
 
 # detection parameter keys shown on the Configuration tab (numeric)
@@ -173,7 +177,7 @@ class TcpServer:
             except OSError:
                 break
             with self.lock:
-                self.clients.append(c)
+                self.clients.append((c, addr))
             self.log("TCP client connected: %s:%s" % addr)
 
     def broadcast(self, text):
@@ -182,24 +186,45 @@ class TcpServer:
         data = text.encode("ascii", "replace")
         dead = []
         with self.lock:
-            for c in self.clients:
+            for c, addr in self.clients:
                 try:
                     c.sendall(data)
                 except OSError:
-                    dead.append(c)
-            for c in dead:
+                    dead.append((c, addr))
+            for c, addr in dead:
                 try:
                     c.close()
                 except OSError:
                     pass
-                self.clients.remove(c)
+                self.clients.remove((c, addr))
         if dead:
             self.log("TCP: dropped %d disconnected client(s)" % len(dead))
+
+    def info(self):
+        """(running, [client 'ip:port' strings]) snapshot for the GUI.
+        Also reaps clients that have disconnected while idle."""
+        with self.lock:
+            alive = []
+            for c, addr in self.clients:
+                try:
+                    r, _, _ = select.select([c], [], [], 0)
+                    if r and c.recv(1, socket.MSG_PEEK) == b"":
+                        c.close()               # peer closed
+                        continue
+                except OSError:
+                    try:
+                        c.close()
+                    except OSError:
+                        pass
+                    continue
+                alive.append((c, addr))
+            self.clients = alive
+            return self.running, ["%s:%s" % addr for _, addr in alive]
 
     def stop(self):
         self.running = False
         with self.lock:
-            for c in self.clients:
+            for c, _ in self.clients:
                 try:
                     c.close()
                 except OSError:
@@ -256,6 +281,12 @@ class Detector:
                 continue
             rings.append((x, y, r))
         return sorted(rings, key=lambda t: (t[1], t[0]))
+
+
+def sort_rings(rings, by="y", desc=False):
+    """rings = [(x, y, r), ...]; sort by y | x | diameter."""
+    idx = {"x": 0, "y": 1, "diameter": 2}.get(by, 1)
+    return sorted(rings, key=lambda t: t[idx], reverse=bool(desc))
 
 
 def annotate(img, rings, cfg=None, H=None):
@@ -439,6 +470,8 @@ class Worker(threading.Thread):
             img, rings = self._detect(path)
             if img is None:
                 return
+            rings = sort_rings(rings, self.cfg.get("sort_by", "y"),
+                               self.cfg.get("sort_desc", False))
             H = load_homography(self.cfg.get("homography_file", ""))
             vis, recs = annotate(img, rings, self.cfg, H)
             self._write_csv(name, recs)
@@ -552,6 +585,9 @@ class App:
         self.status = ttk.Label(bar, text="Loading model...",
                                 foreground="#b26b00")
         self.status.pack(side=tk.RIGHT)
+        self.tcp_status = ttk.Label(bar, text="TCP: disabled",
+                                    foreground="#777")
+        self.tcp_status.pack(side=tk.RIGHT, padx=12)
 
         mid = ttk.Frame(p)
         mid.pack(fill=tk.BOTH, expand=True)
@@ -564,9 +600,11 @@ class App:
         cols = ("id", "x_px", "y_px", "dia_px", "robot_x", "robot_y")
         self.tree = ttk.Treeview(right, columns=cols, show="headings", height=12)
         for c, w in zip(cols, (34, 58, 58, 62, 92, 92)):
-            self.tree.heading(c, text=c)
+            self.tree.heading(c, text=c,
+                              command=lambda cc=c: self._sort_tree(cc))
             self.tree.column(c, width=w, anchor=tk.CENTER)
         self.tree.pack(fill=tk.BOTH, expand=True)
+        self._tree_sort = (None, False)   # (column, descending)
 
         logf = ttk.LabelFrame(p, text="Log", padding=4)
         logf.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=(0, 6))
@@ -604,6 +642,24 @@ class App:
         ttk.Label(det, text="MODEL change takes effect on the next image "
                             "(model reloads).", foreground="#777").grid(
             row=len(DET_PARAMS) + 1, column=1, sticky=tk.W, pady=(2, 0))
+
+        out = ttk.LabelFrame(p, text="Output ordering", padding=12)
+        out.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Label(out, text="Sort rings by", width=26).grid(row=0, column=0,
+                                                            sticky=tk.W)
+        self.sort_by_var = tk.StringVar(value=self.cfg.get("sort_by", "y"))
+        ttk.Combobox(out, textvariable=self.sort_by_var, width=14,
+                     state="readonly",
+                     values=["y", "x", "diameter"]).grid(row=0, column=1,
+                                                         sticky=tk.W)
+        self.sort_desc_var = tk.BooleanVar(value=bool(self.cfg.get("sort_desc")))
+        ttk.Checkbutton(out, text="descending",
+                        variable=self.sort_desc_var).grid(row=0, column=2,
+                                                          padx=10)
+        ttk.Label(out, text="Sets the order of ring ids in the table, CSV and "
+                            "TCP output. (Click a Live column header to re-sort "
+                            "the view.)", foreground="#777").grid(
+            row=1, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
 
         tcp = ttk.LabelFrame(p, text="TCP server (sends robot XY to controller)",
                              padding=12)
@@ -766,6 +822,8 @@ class App:
             self.cfg["tcp_host"] = self.vars["tcp_host"].get() or "0.0.0.0"
             self.cfg["tcp_port"] = int(self.vars["tcp_port"].get())
             self.cfg["tcp_format"] = self.vars["tcp_format"].get() or "{id},{x},{y}"
+            self.cfg["sort_by"] = self.sort_by_var.get() or "y"
+            self.cfg["sort_desc"] = bool(self.sort_desc_var.get())
         except ValueError as e:
             messagebox.showerror("Invalid value",
                                  "Numbers required for poll/offset/detection "
@@ -779,6 +837,8 @@ class App:
             if key in self.cfg:
                 var.set(str(self.cfg[key]))
         self.tcp_enabled_var.set(bool(self.cfg.get("tcp_enabled")))
+        self.sort_by_var.set(self.cfg.get("sort_by", "y"))
+        self.sort_desc_var.set(bool(self.cfg.get("sort_desc")))
 
     def save(self, announce=True):
         if not self._read_fields():
@@ -997,7 +1057,35 @@ class App:
                     self._show_calib(payload)
         except queue.Empty:
             pass
+        self._update_tcp_status()
         self.root.after(150, self._pump)
+
+    def _update_tcp_status(self):
+        running, addrs = self.tcp.info()
+        if not running:
+            self.tcp_status.config(text="TCP: off", foreground="#777")
+        elif not addrs:
+            self.tcp_status.config(text="TCP: listening, 0 clients",
+                                   foreground="#b26b00")
+        else:
+            shown = ", ".join(addrs[:2]) + ("..." if len(addrs) > 2 else "")
+            self.tcp_status.config(
+                text="TCP: %d client(s) [%s]" % (len(addrs), shown),
+                foreground="#1a7f37")
+
+    def _sort_tree(self, col):
+        desc = not self._tree_sort[1] if self._tree_sort[0] == col else False
+        self._tree_sort = (col, desc)
+        rows = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
+
+        def key(v):
+            try:
+                return float(v[0])
+            except ValueError:
+                return v[0]
+        rows.sort(key=key, reverse=desc)
+        for i, (_, k) in enumerate(rows):
+            self.tree.move(k, "", i)
 
     def _log(self, m):
         self.logbox.config(state=tk.NORMAL)
