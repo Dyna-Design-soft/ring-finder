@@ -22,6 +22,7 @@
 # ============================================================
 
 import os
+import re
 import sys
 import csv
 import glob
@@ -71,7 +72,47 @@ DEFAULT_CONFIG = {
     # ---- output ordering ----
     "sort_by": "y",                 # y | x | diameter  (order of ring ids/CSV/TCP)
     "sort_desc": False,
+    # ---- read robot position over TCP (calibration) ----
+    "robot_ip": "127.0.0.1",
+    "robot_port": 4000,
+    "robot_query": "STP",           # command sent to request position (blank = just read)
 }
+
+
+ROBOT_XY_RE = re.compile(rb"X\s*=\s*(-?\d+\.?\d*)\s*,\s*Y\s*=\s*(-?\d+\.?\d*)",
+                         re.IGNORECASE)
+
+
+def read_robot_xy(host, port, query, timeout=3.0):
+    """Connect to the robot, optionally send `query`, read a reply and parse
+    'X=xx.xx,Y=yy.yy'. Returns (x, y) or raises."""
+    s = socket.create_connection((host, int(port)), timeout=timeout)
+    try:
+        s.settimeout(timeout)
+        if query:
+            s.sendall((query + "\n").encode("ascii", "replace"))
+        buf = b""
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                d = s.recv(256)
+            except socket.timeout:
+                break
+            if not d:
+                break
+            buf += d
+            m = ROBOT_XY_RE.search(buf)
+            if m:
+                return float(m.group(1)), float(m.group(2))
+        m = ROBOT_XY_RE.search(buf)
+        if m:
+            return float(m.group(1)), float(m.group(2))
+        raise ValueError("no 'X=..,Y=..' in reply: %r" % buf[:80])
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
 
 # detection parameter keys shown on the Configuration tab (numeric)
 DET_PARAMS = ["conf", "iou", "min_area_frac", "max_area_frac",
@@ -716,6 +757,16 @@ class App:
         self.tcp_info = ttk.Label(tcp, text="", foreground="#555")
         self.tcp_info.grid(row=6, column=1, sticky=tk.W, pady=(2, 0))
 
+        robot = ttk.LabelFrame(p, text="Robot position over TCP "
+                                       "(Calibration: Read robot XY)", padding=12)
+        robot.pack(fill=tk.X, padx=10, pady=6)
+        self._config_row(robot, 0, "robot_ip", "Robot IP", "text")
+        self._config_row(robot, 1, "robot_port", "Robot port", "text")
+        self._config_row(robot, 2, "robot_query", "Request command", "text")
+        ttk.Label(robot, text="App connects, sends the command, and parses a "
+                             "reply like  X=12.34,Y=56.78 .",
+                  foreground="#777").grid(row=3, column=1, sticky=tk.W)
+
         btns = ttk.Frame(p, padding=(10, 4))
         btns.pack(fill=tk.X)
         ttk.Button(btns, text="Save settings", command=self.save).pack(
@@ -781,8 +832,10 @@ class App:
         ttk.Label(entry, text="Robot Y").grid(row=0, column=2, padx=2)
         self.ry_var = tk.StringVar()
         ttk.Entry(entry, textvariable=self.ry_var, width=10).grid(row=0, column=3)
+        ttk.Button(entry, text="Read robot XY (TCP)",
+                   command=self.calib_read_robot).grid(row=0, column=4, padx=6)
         ttk.Button(entry, text="Add point",
-                   command=self.calib_add).grid(row=0, column=4, padx=6)
+                   command=self.calib_add).grid(row=0, column=5, padx=2)
 
         cols = ("#", "px", "py", "robot_x", "robot_y")
         self.ptree = ttk.Treeview(right, columns=cols, show="headings", height=10)
@@ -864,6 +917,9 @@ class App:
             self.cfg["tcp_empty_message"] = self.vars["tcp_empty_message"].get()
             self.cfg["sort_by"] = self.sort_by_var.get() or "y"
             self.cfg["sort_desc"] = bool(self.sort_desc_var.get())
+            self.cfg["robot_ip"] = self.vars["robot_ip"].get() or "127.0.0.1"
+            self.cfg["robot_port"] = int(self.vars["robot_port"].get())
+            self.cfg["robot_query"] = self.vars["robot_query"].get()
         except ValueError as e:
             messagebox.showerror("Invalid value",
                                  "Numbers required for poll/offset/detection "
@@ -1014,6 +1070,20 @@ class App:
         idx = max(0, min(idx, len(self._calib_rings) - 1))
         return self._calib_rings[idx]
 
+    def calib_read_robot(self):
+        host = self.vars["robot_ip"].get()
+        port = self.vars["robot_port"].get()
+        query = self.vars["robot_query"].get()
+        self._log("reading robot position from %s:%s ..." % (host, port))
+
+        def work():
+            try:
+                x, y = read_robot_xy(host, port, query)
+                self.q.put(("robot_xy", (x, y)))
+            except Exception as e:
+                self.q.put(("robot_xy_err", str(e)))
+        threading.Thread(target=work, daemon=True).start()
+
     def calib_add(self):
         ring = self._selected_ring()
         if ring is None:
@@ -1095,6 +1165,13 @@ class App:
                     self._show(payload)
                 elif kind == "calib_result":
                     self._show_calib(payload)
+                elif kind == "robot_xy":
+                    x, y = payload
+                    self.rx_var.set("%.3f" % x)
+                    self.ry_var.set("%.3f" % y)
+                    self._log("robot position read: X=%.3f Y=%.3f" % (x, y))
+                elif kind == "robot_xy_err":
+                    self._log("robot read failed: %s" % payload)
         except queue.Empty:
             pass
         self._update_tcp_status()
