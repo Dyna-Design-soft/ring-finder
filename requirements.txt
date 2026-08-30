@@ -2,6 +2,8 @@
 numpy
 opencv-contrib-python
 ultralytics            # FastSAM ring detection (pulls torch, torchvision)
+matplotlib             # imported by ultralytics at import time
+pandas                 # imported by ultralytics at import time
 
 # GUI (scripts/gui.py) - Pillow shows the annotated image in the window.
 # Tkinter ships with standard Python on Windows/macOS; on Linux install the

@@ -21,8 +21,10 @@ hiddenimports = []
 # ship the fitted homography so the exe has a default map
 datas += [("config/robot_map.json", "config")]
 
-# collect the heavy ML packages (data, binaries, submodules)
-for pkg in ("ultralytics", "torch", "torchvision"):
+# collect the heavy ML packages (data, binaries, submodules).
+# NOTE: ultralytics imports matplotlib and pandas at import time, so they
+# must be INCLUDED (do not exclude them) or the frozen app fails to start.
+for pkg in ("ultralytics", "torch", "torchvision", "matplotlib", "pandas"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
@@ -30,7 +32,7 @@ for pkg in ("ultralytics", "torch", "torchvision"):
 
 # package metadata some libraries look up at runtime
 for pkg in ("ultralytics", "torch", "torchvision", "numpy", "opencv-python",
-            "pillow", "tqdm", "pyyaml", "psutil"):
+            "pillow", "tqdm", "pyyaml", "psutil", "matplotlib", "pandas"):
     try:
         datas += copy_metadata(pkg)
     except Exception:
@@ -44,7 +46,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["matplotlib", "pandas"],   # not needed by the app; trims size
+    excludes=[],          # do NOT exclude matplotlib/pandas: ultralytics imports them
     noarchive=False,
 )
 pyz = PYZ(a.pure)
