@@ -29,3 +29,6 @@ FastSAM-*.pt
 !data/incoming/README.txt
 !data/calibration/.gitkeep
 !data/calibration/README.txt
+
+# per-user GUI settings
+config/app_config.json
