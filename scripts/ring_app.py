@@ -532,7 +532,12 @@ class Detector:
         max_af = float(cfg.get("max_area_frac", 0.25))
         min_circ = float(cfg.get("min_circ", 0.75))
         subpixel = bool(cfg.get("subpixel", True))
-        imgsz = int(cfg.get("imgsz", 640))
+        raw = cfg.get("imgsz", 640)
+        if str(raw).strip().lower() == "auto":
+            # match inference size to the input (multiple of 32, capped for CPU)
+            imgsz = int(min(1024, max(640, round(max(H, W) / 32.0) * 32)))
+        else:
+            imgsz = int(raw)
         res = self._predict(img, conf, iou, imgsz)
         rings = []
 
@@ -1099,9 +1104,11 @@ class App:
         r0 += 1
         self._config_row(t_det, r0, "imgsz", "Inference size (imgsz)", "text")
         r0 += 1
-        ttk.Label(t_det, text="imgsz 640 is fastest+most repeatable for ~320x240 "
-                             "input; higher just adds interpolation noise.",
-                  foreground="#777").grid(row=r0, column=1, sticky=tk.W)
+        ttk.Label(t_det, text="imgsz 640 suits ~320x240 input; use a number or "
+                             "'auto' (matches the camera resolution, capped 1024). "
+                             "Recalibrate after changing camera/resolution.",
+                  foreground="#777", wraplength=520, justify=tk.LEFT).grid(
+            row=r0, column=1, sticky=tk.W)
         r0 += 1
         self.measure_inner_var = tk.BooleanVar(
             value=bool(self.cfg.get("measure_inner")))
@@ -1333,7 +1340,8 @@ class App:
             self.cfg["inner_sat_thresh"] = int(self.vars["inner_sat_thresh"].get())
             self.cfg["model_type"] = self.model_type_var.get() or "auto"
             self.cfg["subpixel"] = bool(self.subpixel_var.get())
-            self.cfg["imgsz"] = int(self.vars["imgsz"].get())
+            _isz = self.vars["imgsz"].get().strip()
+            self.cfg["imgsz"] = _isz if _isz.lower() == "auto" else int(_isz)
             self.cfg["tcp_enabled"] = bool(self.tcp_enabled_var.get())
             self.cfg["tcp_host"] = self.vars["tcp_host"].get() or "0.0.0.0"
             self.cfg["tcp_port"] = int(self.vars["tcp_port"].get())
