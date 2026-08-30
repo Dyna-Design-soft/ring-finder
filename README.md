@@ -65,9 +65,11 @@ tabs:
   the ring-id order used in the table, CSV and TCP).
 - **Calibration** — build the pixel→robot homography in-app: **Grab latest
   from folder** or **Load image…** → the ring pixel is detected → set the
-  **Robot X/Y** for that ring (type it, or **Read robot XY (TCP)** to pull the
-  robot's live position — the app sends a request command like `STP` and parses
-  the reply `X=xx.xx,Y=yy.yy`) → **Add point**; collect ≥4 points, then
+  **Robot X/Y** for that ring (type it manually, or tick **Read robot position
+  (TCP)** to continuously read the robot's live position — the app sends the
+  request command like `STP` and parses `X=xx.xx,Y=yy.yy`, showing it live —
+  then press **Update** to copy the live value into the fields) → **Add
+  point**; collect ≥4 points, then
   **Fit & Save** writes the homography file (with in-fit and leave-one-out
   RMS, and RANSAC-flagged bad points).
 

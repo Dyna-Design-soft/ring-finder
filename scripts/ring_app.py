@@ -76,6 +76,7 @@ DEFAULT_CONFIG = {
     "robot_ip": "127.0.0.1",
     "robot_port": 4000,
     "robot_query": "STP",           # command sent to request position (blank = just read)
+    "robot_poll": 0.3,              # seconds between position reads
 }
 
 
@@ -113,6 +114,86 @@ def read_robot_xy(host, port, query, timeout=3.0):
             s.close()
         except OSError:
             pass
+
+
+class RobotReader(threading.Thread):
+    """Keeps a live TCP connection to the robot and continuously reads its
+    current X/Y position. The latest value is available via get_latest();
+    ('robot_live', (x, y)) and ('robot_status', text) go to the queue."""
+
+    def __init__(self, q, get_cfg):
+        super().__init__(daemon=True)
+        self.q = q
+        self.get_cfg = get_cfg
+        self.enabled = threading.Event()
+        self.stop_flag = threading.Event()
+        self._latest = None
+        self._lock = threading.Lock()
+        self._status = ""
+
+    def get_latest(self):
+        with self._lock:
+            return self._latest
+
+    def _set_status(self, text):
+        if text != self._status:
+            self._status = text
+            self.q.put(("robot_status", text))
+
+    def run(self):
+        sock = None
+        buf = b""
+        while not self.stop_flag.is_set():
+            if not self.enabled.is_set():
+                if sock:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    sock = None
+                    self._set_status("off")
+                time.sleep(0.2)
+                continue
+            cfg = self.get_cfg()
+            host = cfg.get("robot_ip", "127.0.0.1")
+            port = int(cfg.get("robot_port", 4000))
+            query = cfg.get("robot_query", "")
+            try:
+                interval = float(cfg.get("robot_poll", 0.3) or 0.3)
+            except (TypeError, ValueError):
+                interval = 0.3
+            try:
+                if sock is None:
+                    sock = socket.create_connection((host, port), timeout=3)
+                    sock.settimeout(3)
+                    buf = b""
+                    self._set_status("connected %s:%s" % (host, port))
+                if query:
+                    sock.sendall((query + "\n").encode("ascii", "replace"))
+                data = sock.recv(256)
+                if not data:
+                    raise OSError("connection closed")
+                buf += data
+                matches = list(ROBOT_XY_RE.finditer(buf))
+                if matches:
+                    m = matches[-1]
+                    x, y = float(m.group(1)), float(m.group(2))
+                    with self._lock:
+                        self._latest = (x, y)
+                    self.q.put(("robot_live", (x, y)))
+                    buf = buf[m.end():][-256:]
+                time.sleep(interval)
+            except Exception as e:
+                if sock:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    sock = None
+                with self._lock:
+                    self._latest = None
+                self._set_status("disconnected (%s)" % e)
+                time.sleep(1.0)
 
 # detection parameter keys shown on the Configuration tab (numeric)
 DET_PARAMS = ["conf", "iou", "min_area_frac", "max_area_frac",
@@ -598,6 +679,8 @@ class App:
         self.tcp = TcpServer(lambda m: self.q.put(("log", m)))
         self.worker = Worker(self.q, self.cfg, self.tcp)
         self.worker.start()
+        self.robot_reader = RobotReader(self.q, lambda: self.cfg)
+        self.robot_reader.start()
         if self.cfg.get("tcp_enabled"):
             self.tcp.start(self.cfg.get("tcp_host", "0.0.0.0"),
                            self.cfg.get("tcp_port", 5000))
@@ -763,9 +846,12 @@ class App:
         self._config_row(robot, 0, "robot_ip", "Robot IP", "text")
         self._config_row(robot, 1, "robot_port", "Robot port", "text")
         self._config_row(robot, 2, "robot_query", "Request command", "text")
-        ttk.Label(robot, text="App connects, sends the command, and parses a "
-                             "reply like  X=12.34,Y=56.78 .",
-                  foreground="#777").grid(row=3, column=1, sticky=tk.W)
+        self._config_row(robot, 3, "robot_poll", "Read interval (seconds)", "text")
+        ttk.Label(robot, text="App connects and continuously reads the position, "
+                             "parsing a reply like  X=12.34,Y=56.78 . In the "
+                             "Calibration tab, 'Update' copies the live value "
+                             "into the entry fields.",
+                  foreground="#777").grid(row=4, column=1, sticky=tk.W)
 
         btns = ttk.Frame(p, padding=(10, 4))
         btns.pack(fill=tk.X)
@@ -823,7 +909,21 @@ class App:
 
         right = ttk.LabelFrame(mid, text="Collected points", padding=6)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=6, pady=6)
-        # robot XY entry
+
+        # live robot position over TCP
+        livef = ttk.Frame(right)
+        livef.pack(fill=tk.X, pady=(0, 4))
+        self.robot_live_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(livef, text="Read robot position (TCP)",
+                        variable=self.robot_live_var,
+                        command=self._toggle_robot_read).pack(side=tk.LEFT)
+        self.robot_live_lbl = ttk.Label(livef, text="live: --",
+                                        foreground="#777")
+        self.robot_live_lbl.pack(side=tk.LEFT, padx=8)
+        ttk.Button(livef, text="Update ↓",
+                   command=self.calib_update_from_live).pack(side=tk.RIGHT)
+
+        # robot XY entry (manual or filled by Update)
         entry = ttk.Frame(right)
         entry.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(entry, text="Robot X").grid(row=0, column=0, padx=2)
@@ -832,10 +932,8 @@ class App:
         ttk.Label(entry, text="Robot Y").grid(row=0, column=2, padx=2)
         self.ry_var = tk.StringVar()
         ttk.Entry(entry, textvariable=self.ry_var, width=10).grid(row=0, column=3)
-        ttk.Button(entry, text="Read robot XY (TCP)",
-                   command=self.calib_read_robot).grid(row=0, column=4, padx=6)
         ttk.Button(entry, text="Add point",
-                   command=self.calib_add).grid(row=0, column=5, padx=2)
+                   command=self.calib_add).grid(row=0, column=4, padx=6)
 
         cols = ("#", "px", "py", "robot_x", "robot_y")
         self.ptree = ttk.Treeview(right, columns=cols, show="headings", height=10)
@@ -920,6 +1018,7 @@ class App:
             self.cfg["robot_ip"] = self.vars["robot_ip"].get() or "127.0.0.1"
             self.cfg["robot_port"] = int(self.vars["robot_port"].get())
             self.cfg["robot_query"] = self.vars["robot_query"].get()
+            self.cfg["robot_poll"] = float(self.vars["robot_poll"].get())
         except ValueError as e:
             messagebox.showerror("Invalid value",
                                  "Numbers required for poll/offset/detection "
@@ -995,6 +1094,7 @@ class App:
             return
         try:
             self.worker.stop_flag.set()
+            self.robot_reader.stop_flag.set()
             self.tcp.stop()
         except Exception:
             pass
@@ -1070,19 +1170,25 @@ class App:
         idx = max(0, min(idx, len(self._calib_rings) - 1))
         return self._calib_rings[idx]
 
-    def calib_read_robot(self):
-        host = self.vars["robot_ip"].get()
-        port = self.vars["robot_port"].get()
-        query = self.vars["robot_query"].get()
-        self._log("reading robot position from %s:%s ..." % (host, port))
+    def _toggle_robot_read(self):
+        # make sure the reader uses the latest IP/port/command from the fields
+        self._read_fields()
+        if self.robot_live_var.get():
+            self.robot_reader.enabled.set()
+            self._log("robot position read: ON (%s:%s)"
+                      % (self.cfg.get("robot_ip"), self.cfg.get("robot_port")))
+        else:
+            self.robot_reader.enabled.clear()
 
-        def work():
-            try:
-                x, y = read_robot_xy(host, port, query)
-                self.q.put(("robot_xy", (x, y)))
-            except Exception as e:
-                self.q.put(("robot_xy_err", str(e)))
-        threading.Thread(target=work, daemon=True).start()
+    def calib_update_from_live(self):
+        latest = self.robot_reader.get_latest()
+        if latest is None:
+            self._log("no live robot position yet "
+                      "(enable 'Read robot position (TCP)' and wait for a value)")
+            return
+        x, y = latest
+        self.rx_var.set("%.3f" % x)
+        self.ry_var.set("%.3f" % y)
 
     def calib_add(self):
         ring = self._selected_ring()
@@ -1148,6 +1254,8 @@ class App:
 
     def on_close(self):
         self.worker.stop_flag.set()
+        self.robot_reader.stop_flag.set()
+        self.tcp.stop()
         self.root.after(100, self.root.destroy)
 
     # ---- pump ----
@@ -1165,13 +1273,16 @@ class App:
                     self._show(payload)
                 elif kind == "calib_result":
                     self._show_calib(payload)
-                elif kind == "robot_xy":
+                elif kind == "robot_live":
                     x, y = payload
-                    self.rx_var.set("%.3f" % x)
-                    self.ry_var.set("%.3f" % y)
-                    self._log("robot position read: X=%.3f Y=%.3f" % (x, y))
-                elif kind == "robot_xy_err":
-                    self._log("robot read failed: %s" % payload)
+                    self.robot_live_lbl.config(
+                        text="live: X=%.3f  Y=%.3f" % (x, y), foreground="#1a7f37")
+                elif kind == "robot_status":
+                    if payload not in ("off",):
+                        self._log("robot: %s" % payload)
+                    if payload == "off" or payload.startswith("disconnected"):
+                        self.robot_live_lbl.config(text="live: -- (%s)" % payload,
+                                                   foreground="#777")
         except queue.Empty:
             pass
         self._update_tcp_status()
