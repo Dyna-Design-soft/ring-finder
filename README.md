@@ -101,28 +101,59 @@ Take ~15–25 photos of the board and **vary the pose a lot**:
 
 Re-run until the verdict is **GOOD**.
 
-## Using the result to fix pixel → mm
+## Convert pixel → mm (`pixel_to_mm.py`)
 
-Once you have a trustworthy `calibration.json`, undistort a ring's pixel
-coordinate before converting to millimetres:
+The calibration maps a pixel to a **direction**, not a distance. To get
+millimetres you must add the **scale** of the plane the rings lie on. Two
+ways, both provided by `pixel_to_mm.py` (each undistorts the pixel first):
 
-```python
-import json, numpy as np, cv2
+### A) Homography — recommended, most accurate
 
-cal = json.load(open("calibration.json"))
-K = np.array(cal["camera_matrix"])
-dist = np.array(cal["distortion_coefficients"])
+Put the ChArUco board **flat in the same plane as your rings**, take one
+reference photo, and build a pixel→mm map from it. Exact even if the camera
+is not perfectly perpendicular; no distance measurement needed. Ideal for a
+fixed camera + plane rig — do it once, reuse the map for every ring image.
 
-def undistort_px(x, y):
-    """Map a raw pixel (x, y) to an undistorted pixel in the same frame."""
-    pt = np.array([[[float(x), float(y)]]], dtype=np.float64)
-    out = cv2.undistortPoints(pt, K, dist, P=K)
-    return float(out[0, 0, 0]), float(out[0, 0, 1])
+```bash
+# one-time: build the map (square-mm = your printed square size)
+python pixel_to_mm.py make-map calibration.json board_in_plane.bmp \
+       --square-mm 20 --out plane_map.json
+
+# convert a ring's pixel position
+python pixel_to_mm.py to-mm calibration.json --map plane_map.json --u 210 --v 128
 ```
 
-To get **millimetres**, you still need the scale of the plane the rings lie
-on. If that plane is the calibration board's plane at a known distance, use
-its pose (a homography from board mm ↔ image px) to map undistorted pixels to
-mm. Measuring positions from the calibrated optical centre `(cx, cy)` — not
-the image centre — and undistorting first removes the off-centre bias you are
-seeing.
+`make-map` prints a fit residual; on the sample data it is ~0.17 mm, and
+detected board corners land on their true mm grid to that accuracy. If the
+residual is large, re-take the board photo flatter and sharper.
+
+### B) Perpendicular pinhole — quick, needs a known distance
+
+If the camera looks straight down at the plane from a known distance `Z` mm:
+
+```bash
+python pixel_to_mm.py to-mm calibration.json --Z 300 --u 210 --v 128
+```
+
+`X_mm = (u − cx)·Z/fx`, `Y_mm = (v − cy)·Z/fy`. Only correct when the camera
+is truly perpendicular and `Z` is known; the homography handles tilt for you.
+
+### In your own code
+
+```python
+import pixel_to_mm as p2m
+K, dist = p2m.load_calibration("calibration.json")
+
+# mode A:
+import json; H = json.load(open("plane_map.json"))["H"]
+x_mm, y_mm = p2m.px_to_mm_homography(u, v, K, dist, H)
+
+# mode B:
+x_mm, y_mm = p2m.px_to_mm_perpendicular(u, v, K, dist, Z_mm=300)
+```
+
+> The common mistake that makes positions "drift away from the centre" is
+> measuring from the image centre `(W/2, H/2)` with a single mm-per-pixel
+> constant. Measure from the calibrated optical centre `(cx, cy)`, undistort
+> first, and use a homography (not one global scale) whenever the plane is
+> tilted or the distance varies.
