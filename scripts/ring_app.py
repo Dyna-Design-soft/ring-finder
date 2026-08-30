@@ -27,6 +27,7 @@ import sys
 import csv
 import glob
 import json
+import shutil
 import time
 import queue
 import socket
@@ -457,6 +458,27 @@ def fit_circle_ls(pts):
     if not np.isfinite(r2) or r2 <= 0:
         raise ValueError("bad circle fit")
     return float(cx), float(cy), float(np.sqrt(r2))
+
+
+def download_asset(name, dest_dir, log=None):
+    """Download a model weight (e.g. FastSAM-x.pt) into dest_dir. Returns the
+    local path. Uses the ultralytics asset downloader; needs internet once."""
+    base = os.path.basename(str(name))
+    dest = os.path.join(dest_dir, base)
+    if os.path.exists(dest):
+        if log:
+            log("model already present: %s" % dest)
+        return dest
+    from ultralytics.utils.downloads import attempt_download_asset
+    p = attempt_download_asset(base)          # downloads, returns local path
+    if p and os.path.exists(p):
+        if os.path.abspath(p) != os.path.abspath(dest):
+            os.makedirs(dest_dir, exist_ok=True)
+            shutil.copy(p, dest)
+        if log:
+            log("model downloaded: %s" % dest)
+        return dest
+    raise RuntimeError("download failed for %s" % base)
 
 
 class Detector:
@@ -1056,6 +1078,8 @@ class App:
 
         # --- Detection ---
         self._config_row(t_det, 0, "model", "MODEL (.pt)", "openfile")
+        ttk.Button(t_det, text="Download",
+                   command=self.download_model).grid(row=0, column=3, padx=4)
         ttk.Label(t_det, text="Model type", width=26).grid(row=1, column=0,
                                                            sticky=tk.W, pady=4)
         self.model_type_var = tk.StringVar(value=self.cfg.get("model_type", "auto"))
@@ -1468,6 +1492,18 @@ class App:
             idx = 0
         idx = max(0, min(idx, len(self._calib_rings) - 1))
         return self._calib_rings[idx]
+
+    def download_model(self):
+        name = self.vars["model"].get() or "FastSAM-x.pt"
+        self._log("downloading model '%s' (needs internet) ..." % name)
+
+        def work():
+            try:
+                p = download_asset(name, ROOT, lambda m: self.q.put(("log", m)))
+                self.q.put(("log", "model ready: %s" % p))
+            except Exception as e:
+                self.q.put(("log", "model download failed: %s" % e))
+        threading.Thread(target=work, daemon=True).start()
 
     def _toggle_robot_read(self):
         # make sure the reader uses the latest IP/port/command from the fields

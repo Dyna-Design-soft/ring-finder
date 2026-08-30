@@ -55,7 +55,10 @@ build_exe.bat
 target PC. When frozen, the app keeps `config\` and `data\` **next to the
 exe**, so settings (`config\app_config.json`) and results persist and stay
 editable. The FastSAM weight isn't bundled: on first run it downloads, or drop
-`FastSAM-x.pt` beside the exe.
+`FastSAM-x.pt` beside the exe, or use the **Download** button on the
+Configuration → Detection tab (fetches the model named in MODEL into the app
+folder — handy for an offline PC: download once on a connected machine and
+copy the `.pt` over).
 
 **Run `dist\ring_app\ring_app.exe`, not the copy under `build\`** (`build\`
 is only PyInstaller's scratch folder). Keep the exe next to its `_internal\`
