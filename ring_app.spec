@@ -18,8 +18,8 @@ datas = []
 binaries = []
 hiddenimports = []
 
-# ship the fitted homography so the exe has a default map
-datas += [("config/robot_map.json", "config")]
+# ship the fitted homography and the window icon
+datas += [("config/robot_map.json", "config"), ("assets/ring_app.ico", "assets")]
 
 # collect the heavy ML packages (data, binaries, submodules).
 # NOTE: ultralytics imports matplotlib and pandas at import time, so they
@@ -58,7 +58,7 @@ exe = EXE(
     exclude_binaries=True,
     name="ring_app",
     console=True,           # keep True until the first build runs; flip to False after
-    icon=None,
+    icon="assets/ring_app.ico",
 )
 coll = COLLECT(
     exe,

@@ -94,7 +94,9 @@ tabs:
   only the current readings), **XY offset (mm)**,
   **auto-delete images older than N min**, calibration (homography) file, the
   **FastSAM detection parameters** (`model, conf, iou, min/max_area_frac,
-  min_circ, min_radius_frac`), a **TCP server** (host/port/line format), and
+  min_circ, min_radius_frac`), an optional **inner-diameter (hole)**
+  measurement (best-effort, image-based), a **TCP server** (host/port/line
+  format), and
   **output ordering** (sort rings by `y`, `x`, or `diameter`, asc/desc — sets
   the ring-id order used in the table, CSV and TCP).
 - **Calibration** — build the pixel→robot homography in-app: **Grab latest

@@ -48,6 +48,11 @@ else:
     ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.path.join(ROOT, "config", "app_config.json")
 
+# bundled resources (icon) live in _MEIPASS when frozen, else the project root
+_RES = getattr(sys, "_MEIPASS",
+               os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ICON_FILE = os.path.join(_RES, "assets", "ring_app.ico")
+
 DEFAULT_CONFIG = {
     "watch_folder": os.path.join(ROOT, "data", "incoming"),
     "image_ext": ".bmp",
@@ -68,6 +73,8 @@ DEFAULT_CONFIG = {
     "max_area_frac": 0.25,
     "min_circ": 0.75,
     "min_radius_frac": 0.03,
+    "measure_inner": False,         # also estimate inner diameter (hole) - best effort
+    "inner_sat_thresh": 70,         # metal is below this saturation; hole above
     # ---- TCP server (sends robot XY to the controller) ----
     "tcp_enabled": False,
     "tcp_host": "0.0.0.0",
@@ -484,24 +491,55 @@ def sort_rings(rings, by="y", desc=False):
     return sorted(rings, key=lambda t: t[idx], reverse=bool(desc))
 
 
+def inner_radius(img, x, y, r, sat_thresh=70):
+    """Estimate the washer hole radius (px) from the image. FastSAM masks the
+    washer solid, so we use the hole showing the (saturated) background inside
+    the outer circle. Returns 0 if no clear hole. Best-effort / background-
+    dependent."""
+    xi, yi, ri = int(round(x)), int(round(y)), int(round(r))
+    H, W = img.shape[:2]
+    S = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)[:, :, 1]
+    Y, X = np.ogrid[:H, :W]
+    disc = ((X - xi) ** 2 + (Y - yi) ** 2) <= (ri * 0.92) ** 2
+    hole = (disc & (S >= sat_thresh)).astype(np.uint8)   # non-metal inside outer
+    hole = cv2.morphologyEx(hole, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    cnts, _ = cv2.findContours(hole, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = 0.0
+    for c in cnts:
+        (hx, hy), hr = cv2.minEnclosingCircle(c)
+        if (hx - xi) ** 2 + (hy - yi) ** 2 < (0.5 * ri) ** 2 \
+                and 3 < hr < 0.9 * ri and hr > best:
+            best = hr
+    return best
+
+
 def annotate(img, rings, cfg=None, mapper=None):
     """Draw rings; returns (vis, records)."""
     ox = float(cfg.get("offset_x", 0.0)) if cfg else 0.0
     oy = float(cfg.get("offset_y", 0.0)) if cfg else 0.0
+    do_inner = bool(cfg.get("measure_inner")) if cfg else False
+    sat = int(cfg.get("inner_sat_thresh", 70)) if cfg else 70
     vis = img.copy()
     recs = []
     for i, (x, y, r) in enumerate(rings):
         rec = {"id": i + 1, "x": round(x, 1), "y": round(y, 1),
                "diameter": round(2 * r, 1), "robot_x": "", "robot_y": "",
-               "diameter_mm": ""}
+               "diameter_mm": "", "inner_dia": "", "inner_dia_mm": ""}
+        ir = inner_radius(img, x, y, r, sat) if do_inner else 0.0
+        if ir > 0:
+            rec["inner_dia"] = round(2 * ir, 1)
         label = str(i + 1)
         if mapper is not None:
             rx, ry = map_point(mapper, x, y)
             rec["robot_x"] = round(rx + ox, 3)
             rec["robot_y"] = round(ry + oy, 3)
             rec["diameter_mm"] = round(map_diameter_mm(mapper, x, y, r), 3)
+            if ir > 0:
+                rec["inner_dia_mm"] = round(map_diameter_mm(mapper, x, y, ir), 3)
             label += " (%.1f,%.1f) D%.1f" % (rec["robot_x"], rec["robot_y"],
                                              rec["diameter_mm"])
+        if ir > 0:
+            cv2.circle(vis, (int(x), int(y)), int(ir), (0, 180, 255), 2)
         cv2.circle(vis, (int(x), int(y)), int(r), (0, 255, 0), 2)
         cv2.drawMarker(vis, (int(x), int(y)), (0, 0, 255), cv2.MARKER_CROSS, 18, 2)
         cv2.putText(vis, label, (int(x) - 12, int(y) - int(r) - 5),
@@ -742,12 +780,13 @@ class Worker(threading.Thread):
                 if new:
                     w.writerow(["timestamp", "image", "ring_id", "x_px",
                                 "y_px", "diameter_px", "robot_x", "robot_y",
-                                "diameter_mm"])
+                                "diameter_mm", "inner_dia_px", "inner_dia_mm"])
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 for r in rings:
                     w.writerow([ts, image, r["id"], r["x"], r["y"],
                                 r["diameter"], r["robot_x"], r["robot_y"],
-                                r.get("diameter_mm", "")])
+                                r.get("diameter_mm", ""), r.get("inner_dia", ""),
+                                r.get("inner_dia_mm", "")])
         except Exception as e:
             self.log("CSV write failed: %s" % e)
 
@@ -761,12 +800,14 @@ class Worker(threading.Thread):
             with open(path, "w", newline="") as f:
                 w = csv.writer(f)
                 w.writerow(["timestamp", "image", "ring_id", "x_px", "y_px",
-                            "diameter_px", "robot_x", "robot_y", "diameter_mm"])
+                            "diameter_px", "robot_x", "robot_y", "diameter_mm",
+                            "inner_dia_px", "inner_dia_mm"])
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 for r in rings:
                     w.writerow([ts, image, r["id"], r["x"], r["y"],
                                 r["diameter"], r["robot_x"], r["robot_y"],
-                                r.get("diameter_mm", "")])
+                                r.get("diameter_mm", ""), r.get("inner_dia", ""),
+                                r.get("inner_dia_mm", "")])
         except Exception as e:
             self.log("latest CSV write failed: %s" % e)
 
@@ -777,6 +818,10 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Ring Finder - live / configuration / calibration")
+        try:
+            root.iconbitmap(ICON_FILE)
+        except Exception:
+            pass
         root.geometry("1040x720")
         self.cfg = load_config()
         self.q = queue.Queue()
@@ -863,9 +908,10 @@ class App:
         self.img_canvas.bind("<Button-5>", lambda e: self._zoom(-0.25))
         right = ttk.LabelFrame(mid, text="Rings (pixel + robot mm)", padding=6)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=6, pady=6)
-        cols = ("id", "x_px", "y_px", "dia_px", "robot_x", "robot_y", "dia_mm")
+        cols = ("id", "x_px", "y_px", "dia_px", "robot_x", "robot_y", "dia_mm",
+                "in_dia_px", "in_dia_mm")
         self.tree = ttk.Treeview(right, columns=cols, show="headings", height=12)
-        for c, w in zip(cols, (30, 54, 54, 56, 84, 84, 70)):
+        for c, w in zip(cols, (28, 50, 50, 52, 78, 78, 64, 60, 62)):
             self.tree.heading(c, text=c,
                               command=lambda cc=c: self._sort_tree(cc))
             self.tree.column(c, width=w, anchor=tk.CENTER)
@@ -944,10 +990,19 @@ class App:
         self._config_row(t_det, 0, "model", "MODEL", "text")
         for i, key in enumerate(DET_PARAMS):
             self._config_row(t_det, i + 1, key, key.upper(), "text")
-        ttk.Label(t_det, text="MODEL change takes effect on the next image "
-                             "(model reloads). FastSAM-s.pt is faster than -x.pt.",
-                  foreground="#777").grid(row=len(DET_PARAMS) + 1, column=1,
-                                          sticky=tk.W, pady=(4, 0))
+        r0 = len(DET_PARAMS) + 1
+        self.measure_inner_var = tk.BooleanVar(
+            value=bool(self.cfg.get("measure_inner")))
+        ttk.Checkbutton(t_det, text="Also measure inner diameter (hole)",
+                        variable=self.measure_inner_var).grid(
+            row=r0, column=1, sticky=tk.W, pady=(6, 0))
+        self._config_row(t_det, r0 + 1, "inner_sat_thresh",
+                         "Inner hole saturation thresh", "text")
+        ttk.Label(t_det, text="MODEL change reloads the model. Inner diameter is "
+                             "estimated from the image (best-effort, background-"
+                             "dependent); outer diameter is the reliable one.",
+                  foreground="#777", wraplength=520, justify=tk.LEFT).grid(
+            row=r0 + 2, column=1, sticky=tk.W, pady=(4, 0))
 
         # --- Output ---
         ttk.Label(t_out, text="Sort rings by", width=26).grid(row=0, column=0,
@@ -1162,6 +1217,8 @@ class App:
             self.cfg["model"] = self.vars["model"].get() or "FastSAM-x.pt"
             for k in DET_PARAMS:
                 self.cfg[k] = float(self.vars[k].get())
+            self.cfg["measure_inner"] = bool(self.measure_inner_var.get())
+            self.cfg["inner_sat_thresh"] = int(self.vars["inner_sat_thresh"].get())
             self.cfg["tcp_enabled"] = bool(self.tcp_enabled_var.get())
             self.cfg["tcp_host"] = self.vars["tcp_host"].get() or "0.0.0.0"
             self.cfg["tcp_port"] = int(self.vars["tcp_port"].get())
@@ -1191,6 +1248,7 @@ class App:
         self.sort_desc_var.set(bool(self.cfg.get("sort_desc")))
         self.auto_start_var.set(bool(self.cfg.get("auto_start", True)))
         self.undistort_var.set(bool(self.cfg.get("undistort")))
+        self.measure_inner_var.set(bool(self.cfg.get("measure_inner")))
 
     def save(self, announce=True):
         if not self._read_fields():
@@ -1627,7 +1685,8 @@ class App:
         for r in res["rings"]:
             self.tree.insert("", tk.END, values=(
                 r["id"], r["x"], r["y"], r["diameter"],
-                r["robot_x"], r["robot_y"], r.get("diameter_mm", "")))
+                r["robot_x"], r["robot_y"], r.get("diameter_mm", ""),
+                r.get("inner_dia", ""), r.get("inner_dia_mm", "")))
 
     def _show_calib(self, res):
         self._calib_rings = res["rings"]
