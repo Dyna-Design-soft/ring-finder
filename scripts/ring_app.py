@@ -631,8 +631,11 @@ class App:
                    command=self.restart_app).pack(side=tk.LEFT)
         ttk.Button(btns, text="Reload calibration",
                    command=self._refresh_map_info).pack(side=tk.LEFT, padx=8)
-        ttk.Label(btns, text="Robot XY = homography(pixel) + (offset X, offset Y). "
-                            "Folder/poll apply on next Start.",
+        ttk.Button(btns, text="Export config...",
+                   command=self.export_config).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Import config...",
+                   command=self.import_config).pack(side=tk.LEFT, padx=6)
+        ttk.Label(btns, text="Robot XY = homography(pixel) + (offset X, offset Y).",
                   foreground="#777").pack(side=tk.LEFT, padx=10)
 
     def _config_row(self, parent, i, key, label, kind):
@@ -743,7 +746,8 @@ class App:
             self.map_info.config(text="calibration file not found / invalid",
                                  foreground="#cf222e")
 
-    def save(self, announce=True):
+    def _read_fields(self):
+        """Read GUI fields into self.cfg. Returns True on success."""
         try:
             self.cfg["watch_folder"] = self.vars["watch_folder"].get()
             self.cfg["image_ext"] = self.vars["image_ext"].get() or ".bmp"
@@ -767,12 +771,63 @@ class App:
                                  "Numbers required for poll/offset/detection "
                                  "params and TCP port.\n%s" % e)
             return False
+        return True
+
+    def _refresh_fields(self):
+        """Push self.cfg values back into the GUI fields."""
+        for key, var in self.vars.items():
+            if key in self.cfg:
+                var.set(str(self.cfg[key]))
+        self.tcp_enabled_var.set(bool(self.cfg.get("tcp_enabled")))
+
+    def save(self, announce=True):
+        if not self._read_fields():
+            return False
         save_config(self.cfg)
         self._refresh_map_info()
         self._apply_tcp()
         if announce:
             messagebox.showinfo("Saved", "Settings saved to\n%s" % CONFIG_FILE)
         return True
+
+    def export_config(self):
+        if not self._read_fields():
+            return
+        f = filedialog.asksaveasfilename(
+            initialdir=ROOT, defaultextension=".json",
+            initialfile="ring_config.json",
+            filetypes=[("JSON", "*.json"), ("all", "*.*")])
+        if not f:
+            return
+        try:
+            json.dump(self.cfg, open(f, "w"), indent=2)
+            messagebox.showinfo("Exported", "Configuration exported to\n%s" % f)
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+
+    def import_config(self):
+        f = filedialog.askopenfilename(
+            initialdir=ROOT, filetypes=[("JSON", "*.json"), ("all", "*.*")])
+        if not f:
+            return
+        try:
+            data = json.load(open(f))
+            if not isinstance(data, dict):
+                raise ValueError("not a config object")
+        except Exception as e:
+            messagebox.showerror("Import failed", "Cannot read %s\n%s" % (f, e))
+            return
+        # keep only known keys, so a stray file can't inject junk
+        for k, v in data.items():
+            if k in DEFAULT_CONFIG:
+                self.cfg[k] = v
+        self._refresh_fields()
+        save_config(self.cfg)
+        self._refresh_map_info()
+        self._apply_tcp()
+        messagebox.showinfo("Imported",
+                            "Configuration imported from\n%s\n\n"
+                            "Use Save & Restart if you changed the model." % f)
 
     def save_and_restart(self):
         if self.save(announce=False):

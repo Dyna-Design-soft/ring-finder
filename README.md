@@ -64,6 +64,10 @@ tabs:
   **Fit & Save** writes the homography file (with in-fit and leave-one-out
   RMS, and RANSAC-flagged bad points).
 
+  Buttons: **Save settings**, **Save & Restart** / **Restart app** (relaunch
+  so a new model reloads), and **Export config… / Import config…** (share a
+  full settings file between machines; import keeps only known keys).
+
 ```bash
 python scripts/ring_app.py
 ```
