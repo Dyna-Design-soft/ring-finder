@@ -77,6 +77,7 @@ DEFAULT_CONFIG = {
     "robot_port": 4000,
     "robot_query": "STP",           # command sent to request position (blank = just read)
     "robot_poll": 0.3,              # seconds between position reads
+    "auto_start": True,             # start watching automatically when the app opens
 }
 
 
@@ -783,33 +784,39 @@ class App:
 
     # ---- Configuration tab ----
     def _build_config(self, page):
-        # make the whole tab scrollable so the Save buttons are always reachable
-        canvas = tk.Canvas(page, highlightthickness=0)
-        vsb = ttk.Scrollbar(page, orient=tk.VERTICAL, command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        inner = ttk.Frame(canvas)
-        win = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>",
-                    lambda e: canvas.itemconfig(win, width=e.width))
-
-        def _wheel(e):
-            canvas.yview_scroll(int(-(e.delta / 120)) or (-1 if e.delta > 0 else 1),
-                                "units")
-        canvas.bind("<Enter>", lambda e: (
-            canvas.bind_all("<MouseWheel>", _wheel),
-            canvas.bind_all("<Button-4>", lambda ev: canvas.yview_scroll(-1, "units")),
-            canvas.bind_all("<Button-5>", lambda ev: canvas.yview_scroll(1, "units"))))
-        canvas.bind("<Leave>", lambda e: (
-            canvas.unbind_all("<MouseWheel>"),
-            canvas.unbind_all("<Button-4>"),
-            canvas.unbind_all("<Button-5>")))
-
-        p = inner   # build all the config widgets inside the scrollable frame
         self.vars = {}
+
+        # fixed button bar at the BOTTOM (packed first so it is always visible)
+        btns = ttk.Frame(page, padding=(10, 6))
+        btns.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(page, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Button(btns, text="Save settings", command=self.save).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Save & Restart",
+                   command=self.save_and_restart).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="Restart app",
+                   command=self.restart_app).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Reload calibration",
+                   command=self._refresh_map_info).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="Export config...",
+                   command=self.export_config).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Import config...",
+                   command=self.import_config).pack(side=tk.LEFT, padx=6)
+
+        # sub-tabs fill the rest
+        sub = ttk.Notebook(page)
+        sub.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        t_general = ttk.Frame(sub, padding=10)
+        t_det = ttk.Frame(sub, padding=10)
+        t_out = ttk.Frame(sub, padding=10)
+        t_tcp = ttk.Frame(sub, padding=10)
+        t_robot = ttk.Frame(sub, padding=10)
+        sub.add(t_general, text="  General  ")
+        sub.add(t_det, text="  Detection  ")
+        sub.add(t_out, text="  Output  ")
+        sub.add(t_tcp, text="  TCP  ")
+        sub.add(t_robot, text="  Robot  ")
+
+        # --- General ---
         general = [
             ("watch_folder", "Watch folder", "dir"),
             ("image_ext", "Image extension", "text"),
@@ -821,89 +828,72 @@ class App:
             ("auto_delete_minutes", "Auto-delete images older than (min)", "text"),
             ("homography_file", "Calibration (homography) file", "openfile"),
         ]
-        frm = ttk.LabelFrame(p, text="General", padding=12)
-        frm.pack(fill=tk.X, padx=10, pady=(10, 6))
         for i, (key, label, kind) in enumerate(general):
-            self._config_row(frm, i, key, label, kind)
-        self.map_info = ttk.Label(frm, text="", foreground="#555")
-        self.map_info.grid(row=len(general), column=1, sticky=tk.W, pady=(2, 4))
+            self._config_row(t_general, i, key, label, kind)
+        self.auto_start_var = tk.BooleanVar(value=bool(self.cfg.get("auto_start", True)))
+        ttk.Checkbutton(t_general, text="Start watching automatically on open",
+                        variable=self.auto_start_var).grid(
+            row=len(general), column=1, sticky=tk.W, pady=(6, 0))
+        self.map_info = ttk.Label(t_general, text="", foreground="#555")
+        self.map_info.grid(row=len(general) + 1, column=1, sticky=tk.W, pady=(6, 0))
+        ttk.Label(t_general,
+                  text="Robot XY = homography(pixel) + (offset X, offset Y).",
+                  foreground="#777").grid(row=len(general) + 2, column=1,
+                                          sticky=tk.W, pady=(2, 0))
         self._refresh_map_info()
 
-        det = ttk.LabelFrame(p, text="Detection parameters (FastSAM)", padding=12)
-        det.pack(fill=tk.X, padx=10, pady=6)
-        self._config_row(det, 0, "model", "MODEL", "text")
+        # --- Detection ---
+        self._config_row(t_det, 0, "model", "MODEL", "text")
         for i, key in enumerate(DET_PARAMS):
-            self._config_row(det, i + 1, key, key.upper(), "text")
-        ttk.Label(det, text="MODEL change takes effect on the next image "
-                            "(model reloads).", foreground="#777").grid(
-            row=len(DET_PARAMS) + 1, column=1, sticky=tk.W, pady=(2, 0))
+            self._config_row(t_det, i + 1, key, key.upper(), "text")
+        ttk.Label(t_det, text="MODEL change takes effect on the next image "
+                             "(model reloads). FastSAM-s.pt is faster than -x.pt.",
+                  foreground="#777").grid(row=len(DET_PARAMS) + 1, column=1,
+                                          sticky=tk.W, pady=(4, 0))
 
-        out = ttk.LabelFrame(p, text="Output ordering", padding=12)
-        out.pack(fill=tk.X, padx=10, pady=6)
-        ttk.Label(out, text="Sort rings by", width=26).grid(row=0, column=0,
-                                                            sticky=tk.W)
+        # --- Output ---
+        ttk.Label(t_out, text="Sort rings by", width=26).grid(row=0, column=0,
+                                                             sticky=tk.W)
         self.sort_by_var = tk.StringVar(value=self.cfg.get("sort_by", "y"))
-        ttk.Combobox(out, textvariable=self.sort_by_var, width=14,
+        ttk.Combobox(t_out, textvariable=self.sort_by_var, width=14,
                      state="readonly",
                      values=["y", "x", "diameter"]).grid(row=0, column=1,
                                                          sticky=tk.W)
         self.sort_desc_var = tk.BooleanVar(value=bool(self.cfg.get("sort_desc")))
-        ttk.Checkbutton(out, text="descending",
-                        variable=self.sort_desc_var).grid(row=0, column=2,
-                                                          padx=10)
-        ttk.Label(out, text="Sets the order of ring ids in the table, CSV and "
-                            "TCP output. (Click a Live column header to re-sort "
-                            "the view.)", foreground="#777").grid(
+        ttk.Checkbutton(t_out, text="descending",
+                        variable=self.sort_desc_var).grid(row=0, column=2, padx=10)
+        ttk.Label(t_out, text="Sets the order of ring ids in the table, CSV and "
+                             "TCP output. (Click a Live column header to re-sort "
+                             "the view.)", foreground="#777").grid(
             row=1, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
 
-        tcp = ttk.LabelFrame(p, text="TCP server (sends robot XY to controller)",
-                             padding=12)
-        tcp.pack(fill=tk.X, padx=10, pady=6)
+        # --- TCP ---
         self.tcp_enabled_var = tk.BooleanVar(value=bool(self.cfg.get("tcp_enabled")))
-        ttk.Checkbutton(tcp, text="Enable TCP server",
-                        variable=self.tcp_enabled_var).grid(
-            row=0, column=1, sticky=tk.W, pady=4)
-        self._config_row(tcp, 1, "tcp_host", "Host / bind address", "text")
-        self._config_row(tcp, 2, "tcp_port", "Port", "text")
-        self._config_row(tcp, 3, "tcp_format", "Line format", "text")
-        self._config_row(tcp, 4, "tcp_empty_message",
-                         "Empty message (no ring)", "text")
-        ttk.Label(tcp, text="Placeholders: {id} {x} {y} {dia} {image}. One line "
-                            "per ring. Empty message sent when nothing is found "
-                            "(blank = send nothing).",
+        ttk.Checkbutton(t_tcp, text="Enable TCP server",
+                        variable=self.tcp_enabled_var).grid(row=0, column=1,
+                                                            sticky=tk.W, pady=4)
+        self._config_row(t_tcp, 1, "tcp_host", "Host / bind address", "text")
+        self._config_row(t_tcp, 2, "tcp_port", "Port", "text")
+        self._config_row(t_tcp, 3, "tcp_format", "Line format", "text")
+        self._config_row(t_tcp, 4, "tcp_empty_message", "Empty message (no ring)",
+                         "text")
+        ttk.Label(t_tcp, text="Placeholders: {id} {x} {y} {dia} {image}. One line "
+                             "per ring. Empty message sent when nothing is found "
+                             "(blank = send nothing).",
                   foreground="#777").grid(row=5, column=1, sticky=tk.W)
-        self.tcp_info = ttk.Label(tcp, text="", foreground="#555")
+        self.tcp_info = ttk.Label(t_tcp, text="", foreground="#555")
         self.tcp_info.grid(row=6, column=1, sticky=tk.W, pady=(2, 0))
 
-        robot = ttk.LabelFrame(p, text="Robot position over TCP "
-                                       "(Calibration: Read robot XY)", padding=12)
-        robot.pack(fill=tk.X, padx=10, pady=6)
-        self._config_row(robot, 0, "robot_ip", "Robot IP", "text")
-        self._config_row(robot, 1, "robot_port", "Robot port", "text")
-        self._config_row(robot, 2, "robot_query", "Request command", "text")
-        self._config_row(robot, 3, "robot_poll", "Read interval (seconds)", "text")
-        ttk.Label(robot, text="App connects and continuously reads the position, "
-                             "parsing a reply like  X=12.34,Y=56.78 . In the "
-                             "Calibration tab, 'Update' copies the live value "
-                             "into the entry fields.",
+        # --- Robot ---
+        self._config_row(t_robot, 0, "robot_ip", "Robot IP", "text")
+        self._config_row(t_robot, 1, "robot_port", "Robot port", "text")
+        self._config_row(t_robot, 2, "robot_query", "Request command", "text")
+        self._config_row(t_robot, 3, "robot_poll", "Read interval (seconds)", "text")
+        ttk.Label(t_robot, text="App connects and continuously reads the position, "
+                              "parsing a reply like  X=12.34,Y=56.78 . In the "
+                              "Calibration tab, 'Update' copies the live value "
+                              "into the entry fields.",
                   foreground="#777").grid(row=4, column=1, sticky=tk.W)
-
-        btns = ttk.Frame(p, padding=(10, 4))
-        btns.pack(fill=tk.X)
-        ttk.Button(btns, text="Save settings", command=self.save).pack(
-            side=tk.LEFT)
-        ttk.Button(btns, text="Save & Restart",
-                   command=self.save_and_restart).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btns, text="Restart app",
-                   command=self.restart_app).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Reload calibration",
-                   command=self._refresh_map_info).pack(side=tk.LEFT, padx=8)
-        ttk.Button(btns, text="Export config...",
-                   command=self.export_config).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Import config...",
-                   command=self.import_config).pack(side=tk.LEFT, padx=6)
-        ttk.Label(btns, text="Robot XY = homography(pixel) + (offset X, offset Y).",
-                  foreground="#777").pack(side=tk.LEFT, padx=10)
 
     def _config_row(self, parent, i, key, label, kind):
         ttk.Label(parent, text=label, width=26).grid(row=i, column=0,
@@ -1054,6 +1044,7 @@ class App:
             self.cfg["robot_port"] = int(self.vars["robot_port"].get())
             self.cfg["robot_query"] = self.vars["robot_query"].get()
             self.cfg["robot_poll"] = float(self.vars["robot_poll"].get())
+            self.cfg["auto_start"] = bool(self.auto_start_var.get())
         except ValueError as e:
             messagebox.showerror("Invalid value",
                                  "Numbers required for poll/offset/detection "
@@ -1069,6 +1060,7 @@ class App:
         self.tcp_enabled_var.set(bool(self.cfg.get("tcp_enabled")))
         self.sort_by_var.set(self.cfg.get("sort_by", "y"))
         self.sort_desc_var.set(bool(self.cfg.get("sort_desc")))
+        self.auto_start_var.set(bool(self.cfg.get("auto_start", True)))
 
     def save(self, announce=True):
         if not self._read_fields():
@@ -1304,6 +1296,8 @@ class App:
                     self.status.config(text="Idle (model ready)",
                                        foreground="#333")
                     self.start_btn.config(state=tk.NORMAL)
+                    if self.cfg.get("auto_start", True):
+                        self.start()   # begin watching automatically on open
                 elif kind == "result":
                     self._show(payload)
                 elif kind == "calib_result":

@@ -60,7 +60,9 @@ tabs:
   > Timing note: on CPU, `FastSAM-x` is ~2–3 s per image; the mm/robot
   > mapping is <1 ms. For faster cycles set `MODEL = FastSAM-s.pt` in
   > Configuration (lighter/faster) or run on a CUDA GPU.
-- **Configuration** — all settings, saved to `config/app_config.json`:
+- **Configuration** — sub-tabs (General / Detection / Output / TCP / Robot)
+  with a fixed Save bar; **starts watching automatically on open** (toggle in
+  General). All settings saved to `config/app_config.json`:
   watch folder, image extension, **filename pattern (glob)**, poll time,
   output CSV, **XY offset (mm)**,
   **auto-delete images older than N min**, calibration (homography) file, the
