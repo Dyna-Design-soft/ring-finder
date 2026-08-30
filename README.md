@@ -34,6 +34,22 @@ ring-finder/
 pip install -r requirements.txt          # first run downloads FastSAM (~138 MB)
 ```
 
+## Build a Windows .exe (ring_app)
+
+On a Windows machine with Python and the deps installed, from the project root:
+
+```bat
+build_exe.bat
+```
+
+(or `pip install pyinstaller` then `pyinstaller ring_app.spec`). Output is
+`dist\ring_app\ring_app.exe` — copy the whole `dist\ring_app` folder to the
+target PC. When frozen, the app keeps `config\` and `data\` **next to the
+exe**, so settings (`config\app_config.json`) and results persist and stay
+editable. The FastSAM weight isn't bundled: on first run it downloads, or drop
+`FastSAM-x.pt` beside the exe. Set `console=True` in `ring_app.spec` if you
+need to see errors while getting the first build working.
+
 ## Quick start — GUI (easiest)
 
 ```bash

@@ -41,7 +41,11 @@ from ultralytics import FastSAM
 # tkinter / Pillow imported lazily in main() so the worker stays testable.
 tk = ttk = filedialog = messagebox = Image = ImageTk = None
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if getattr(sys, "frozen", False):
+    # running as a PyInstaller .exe -> keep config/ and data/ next to the exe
+    ROOT = os.path.dirname(sys.executable)
+else:
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.path.join(ROOT, "config", "app_config.json")
 
 DEFAULT_CONFIG = {
