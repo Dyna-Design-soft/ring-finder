@@ -64,7 +64,8 @@ tabs:
   with a fixed Save bar; **starts watching automatically on open** (toggle in
   General). All settings saved to `config/app_config.json`:
   watch folder, image extension, **filename pattern (glob)**, poll time,
-  output CSV, **XY offset (mm)**,
+  output CSV (append log) and a **latest CSV** (overwritten each image with
+  only the current readings), **XY offset (mm)**,
   **auto-delete images older than N min**, calibration (homography) file, the
   **FastSAM detection parameters** (`model, conf, iou, min/max_area_frac,
   min_circ, min_radius_frac`), a **TCP server** (host/port/line format), and

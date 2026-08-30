@@ -2,6 +2,8 @@
 data/incoming/*_rings.png
 data/incoming/*_rings.json
 data/incoming/results.csv
+data/latest.csv
+data/results.csv
 **/results.csv
 *_ai_rings.png
 *_rings.png

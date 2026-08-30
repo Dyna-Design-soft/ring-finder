@@ -50,6 +50,7 @@ DEFAULT_CONFIG = {
     "name_pattern": "*",        # glob on filename; "*" = any, e.g. "202*_*.bmp"
     "poll_seconds": 0.5,
     "output_csv": os.path.join(ROOT, "data", "results.csv"),
+    "latest_csv": os.path.join(ROOT, "data", "latest.csv"),  # overwritten each image
     "offset_x": 0.0,
     "offset_y": 0.0,
     "homography_file": os.path.join(ROOT, "config", "robot_map.json"),
@@ -602,6 +603,7 @@ class Worker(threading.Thread):
             vis, recs = annotate(img, rings, self.cfg, H)   # applies mm/robot XY
             total_ms = (time.time() - t0) * 1000.0
             self._write_csv(name, recs)
+            self._write_latest_csv(name, recs)
             self._tcp_send(name, recs)
             self.q.put(("result", {"name": name, "image": vis, "rings": recs,
                                    "has_map": H is not None,
@@ -673,6 +675,24 @@ class Worker(threading.Thread):
                                 r["diameter"], r["robot_x"], r["robot_y"]])
         except Exception as e:
             self.log("CSV write failed: %s" % e)
+
+    def _write_latest_csv(self, image, rings):
+        """Overwrite a single-image CSV holding only the current readings."""
+        path = self.cfg.get("latest_csv", "")
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["timestamp", "image", "ring_id", "x_px", "y_px",
+                            "diameter_px", "robot_x", "robot_y"])
+                ts = time.strftime("%Y-%m-%d %H:%M:%S")
+                for r in rings:
+                    w.writerow([ts, image, r["id"], r["x"], r["y"],
+                                r["diameter"], r["robot_x"], r["robot_y"]])
+        except Exception as e:
+            self.log("latest CSV write failed: %s" % e)
 
 
 # ---------------- GUI ----------------
@@ -822,7 +842,8 @@ class App:
             ("image_ext", "Image extension", "text"),
             ("name_pattern", "Filename pattern (glob)", "text"),
             ("poll_seconds", "Poll time (seconds)", "text"),
-            ("output_csv", "Output CSV file", "savefile"),
+            ("output_csv", "Output CSV file (append log)", "savefile"),
+            ("latest_csv", "Latest CSV file (overwritten)", "savefile"),
             ("offset_x", "Offset X (mm)", "text"),
             ("offset_y", "Offset Y (mm)", "text"),
             ("auto_delete_minutes", "Auto-delete images older than (min)", "text"),
@@ -1025,6 +1046,7 @@ class App:
             self.cfg["name_pattern"] = self.vars["name_pattern"].get() or "*"
             self.cfg["poll_seconds"] = float(self.vars["poll_seconds"].get())
             self.cfg["output_csv"] = self.vars["output_csv"].get()
+            self.cfg["latest_csv"] = self.vars["latest_csv"].get()
             self.cfg["offset_x"] = float(self.vars["offset_x"].get())
             self.cfg["offset_y"] = float(self.vars["offset_y"].get())
             self.cfg["auto_delete_minutes"] = float(
