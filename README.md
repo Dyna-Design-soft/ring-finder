@@ -133,6 +133,13 @@ tabs:
   via sin/cos, 4 DOF) - similarity is most robust when the camera views a flat
   plane squarely and often gives the lowest leave-one-out error.
 
+  **Coverage map** shows where the current calibration is strong (green,
+  near points) vs weak (red, far from any point) with each point coloured by
+  its error - so you know where to add points. **Load points from map** pulls
+  an existing map's points back into the table so you can add more and re-fit
+  (**Fit & Save** overwrites the same file to *improve it*, or **Save as...**
+  makes a new one).
+
   Buttons: **Save settings**, **Save & Restart** / **Restart app** (relaunch
   so a new model reloads), and **Export config… / Import config…** (share a
   full settings file between machines; import keeps only known keys).

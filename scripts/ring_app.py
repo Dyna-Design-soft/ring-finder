@@ -426,6 +426,7 @@ def fit_transform(points, kind="homography", ransac_mm=6.0, K=None, dist=None,
         "rms_mm": float(np.sqrt((res ** 2).mean())),
         "loo_rms_mm": loo,
         "coverage_warning": warn,
+        "frame_wh": list(frame_wh) if frame_wh else None,
         "points": [{"id": i + 1, "px": p[0], "py": p[1],
                     "robot_x": p[2], "robot_y": p[3]}
                    for i, p in enumerate(points)],
@@ -1494,6 +1495,8 @@ class App:
                    command=self.calib_remove).pack(side=tk.LEFT)
         ttk.Button(row2, text="Clear all",
                    command=self.calib_clear).pack(side=tk.LEFT, padx=6)
+        ttk.Button(row2, text="Load points from map",
+                   command=self.calib_load_points).pack(side=tk.LEFT)
         self.calib_count = ttk.Label(row2, text="Points: 0  (need >= 4)",
                                      foreground="#b26b00")
         self.calib_count.pack(side=tk.RIGHT)
@@ -1502,6 +1505,8 @@ class App:
         row3.pack(fill=tk.X)
         ttk.Button(row3, text="Fit & Save homography",
                    command=self.calib_fit).pack(side=tk.LEFT)
+        ttk.Button(row3, text="Coverage map",
+                   command=self.calib_coverage).pack(side=tk.LEFT, padx=6)
         self.calib_result = ttk.Label(right, text="", foreground="#333",
                                       wraplength=360, justify=tk.LEFT)
         self.calib_result.pack(fill=tk.X, pady=(6, 0))
@@ -1915,6 +1920,85 @@ class App:
         self.calib_count.config(
             text="Points: %d  (need >= 4)" % n,
             foreground="#1a7f37" if n >= 4 else "#b26b00")
+
+    def calib_load_points(self):
+        """Load the points from the current map so it can be extended/improved."""
+        path = self.vars["homography_file"].get()
+        try:
+            pts = json.load(open(path)).get("points", [])
+        except Exception as e:
+            messagebox.showerror("Load failed", "Cannot read %s\n%s" % (path, e))
+            return
+        if not pts:
+            messagebox.showwarning("No points", "That map file has no saved points.")
+            return
+        self.points = [(p["px"], p["py"], p["robot_x"], p["robot_y"])
+                       for p in pts]
+        self._refresh_points()
+        self._log("loaded %d points from %s (add more, then Fit & Save)"
+                  % (len(self.points), os.path.basename(path)))
+
+    def calib_coverage(self):
+        """Show where the current map is accurate vs weak, to guide improvement."""
+        path = self.vars["homography_file"].get()
+        try:
+            d = json.load(open(path))
+        except Exception as e:
+            messagebox.showerror("Coverage", "Cannot read %s\n%s" % (path, e))
+            return
+        pts = d.get("points", [])
+        mapper = load_mapper(path)
+        if not pts or mapper is None:
+            messagebox.showwarning("Coverage", "Map has no points to assess.")
+            return
+        P = [(p["px"], p["py"]) for p in pts]
+        R = [(p["robot_x"], p["robot_y"]) for p in pts]
+        err = []
+        for (px, py), (rx, ry) in zip(P, R):
+            mx, my = map_point(mapper, px, py)
+            err.append((mx - rx) ** 2 + (my - ry) ** 2)
+        err = [e ** 0.5 for e in err]
+        wh = d.get("frame_wh") or getattr(self, "_calib_wh", None)
+        if wh:
+            W, H = int(wh[0]), int(wh[1])
+        else:
+            W = int(max(p[0] for p in P) + 40)
+            H = int(max(p[1] for p in P) + 40)
+        # coverage heat: green where near a calibration point, red where far
+        mask = np.full((H, W), 255, np.uint8)
+        for px, py in P:
+            xi, yi = int(np.clip(px, 0, W - 1)), int(np.clip(py, 0, H - 1))
+            mask[yi, xi] = 0
+        dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        t = np.clip(dist / (0.20 * np.hypot(W, H)), 0, 1)      # 0 near .. 1 far
+        img = np.zeros((H, W, 3), np.uint8)
+        img[..., 1] = (150 * (1 - t)).astype(np.uint8)         # green = covered
+        img[..., 2] = (200 * t).astype(np.uint8)               # red = uncovered
+        for (px, py), e in zip(P, err):
+            col = (0, 230, 0) if e < 1 else ((0, 180, 255) if e < 2 else (0, 0, 255))
+            cv2.circle(img, (int(px), int(py)), 6, col, -1)
+            cv2.circle(img, (int(px), int(py)), 6, (255, 255, 255), 1)
+        cv2.putText(img, "green=covered  red=add points here  dots: <1 /1-2 />2mm",
+                    (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1,
+                    cv2.LINE_AA)
+        loo = d.get("loo_rms_mm")
+        cv2.putText(img, "model %s  RMS %.2f  LOO %s mm"
+                    % (d.get("transform", "?"), d.get("rms_mm", 0),
+                       ("%.2f" % loo) if loo else "n/a"),
+                    (6, H - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1,
+                    cv2.LINE_AA)
+        out = os.path.splitext(path)[0] + "_coverage.png"
+        try:
+            cv2.imwrite(out, img)
+        except Exception:
+            pass
+        try:
+            self._calib_imgtk = self._to_tk(img, (560, 470))
+            self.calib_canvas.config(image=self._calib_imgtk)
+        except Exception as e:
+            self._log("coverage display error: %s" % e)
+        self._log("coverage map shown (saved %s). Red areas need more points."
+                  % os.path.basename(out))
 
     def calib_fit(self):
         # distortion-aware if enabled and intrinsics available
