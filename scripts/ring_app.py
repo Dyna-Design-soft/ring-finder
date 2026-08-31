@@ -71,6 +71,7 @@ DEFAULT_CONFIG = {
     "model_type": "auto",           # auto | fastsam | yolo | sam
     "subpixel": True,               # least-squares circle fit (more precise)
     "imgsz": 640,                   # inference size; 640 best for ~320x240 input
+    "frames_avg": 1,                # average N frames of a stationary part (1=off)
     "conf": 0.20,
     "iou": 0.7,
     "min_area_frac": 0.004,
@@ -666,6 +667,7 @@ class Worker(threading.Thread):
         self._seen = {}     # name -> (size, mtime) last observed (stability)
         self._proc = {}     # name -> mtime last processed (re-fire on change)
         self._last_cleanup = 0.0
+        self._avg_buf = []
 
     def log(self, m):
         self.q.put(("log", m))
@@ -684,7 +686,7 @@ class Worker(threading.Thread):
                 if kind == "calib":
                     self._calib(path)
                 else:
-                    self._process(path)
+                    self._process(path, allow_avg=False)   # on-demand: no averaging
                 continue
             except queue.Empty:
                 pass
@@ -707,6 +709,7 @@ class Worker(threading.Thread):
                         pass
         except OSError:
             pass
+        self._avg_buf = []
         self.watching.set()
         self.log("Watching %s" % folder)
 
@@ -795,21 +798,39 @@ class Worker(threading.Thread):
                      % (removed, mins))
 
     def _detect(self, path):
-        self.det.load(self.cfg.get("model", "FastSAM-x.pt"),
-                      self.cfg.get("model_type", "auto"))
         img = cv2.imread(path)
         if img is None:
             self.log("cannot read %s" % os.path.basename(path))
             return None, None
-        return img, self.det.find_rings(img, self.cfg)
+        return img, self._detect_img(img)
 
-    def _process(self, path):
+    def _detect_img(self, img):
+        self.det.load(self.cfg.get("model", "FastSAM-x.pt"),
+                      self.cfg.get("model_type", "auto"))
+        return self.det.find_rings(img, self.cfg)
+
+    def _process(self, path, allow_avg=True):
         name = os.path.basename(path)
         try:
-            t0 = time.time()
-            img, rings = self._detect(path)
+            img = cv2.imread(path)
             if img is None:
+                self.log("cannot read %s" % name)
                 return
+            # frame averaging: pool N consecutive frames of a stationary part
+            n = int(self.cfg.get("frames_avg", 1) or 1)
+            if allow_avg and n > 1:
+                if self._avg_buf and self._avg_buf[0].shape != img.shape:
+                    self._avg_buf = []          # size changed -> reset
+                self._avg_buf.append(img.astype(np.float32))
+                if len(self._avg_buf) < n:
+                    self.log("%s -> buffered %d/%d for averaging"
+                             % (name, len(self._avg_buf), n))
+                    return
+                img = (np.mean(self._avg_buf, axis=0)).astype(np.uint8)
+                self._avg_buf = []
+                name = "%s (avg of %d)" % (name, n)
+            t0 = time.time()
+            rings = self._detect_img(img)
             detect_ms = (time.time() - t0) * 1000.0
             rings = sort_rings(rings, self.cfg.get("sort_by", "y"),
                                self.cfg.get("sort_desc", False))
@@ -1111,9 +1132,14 @@ class App:
         r0 += 1
         self._config_row(t_det, r0, "imgsz", "Inference size (imgsz)", "text")
         r0 += 1
+        self._config_row(t_det, r0, "frames_avg", "Frame averaging (N frames)", "text")
+        r0 += 1
         ttk.Label(t_det, text="imgsz 640 suits ~320x240 input; use a number or "
                              "'auto' (matches the camera resolution, capped 1024). "
-                             "Recalibrate after changing camera/resolution.",
+                             "Frame averaging pools N frames of a STATIONARY part "
+                             "to cut noise (1 = off; use only when the part is "
+                             "still for N frames). Recalibrate after changing "
+                             "camera/resolution.",
                   foreground="#777", wraplength=520, justify=tk.LEFT).grid(
             row=r0, column=1, sticky=tk.W)
         r0 += 1
@@ -1349,6 +1375,7 @@ class App:
             self.cfg["subpixel"] = bool(self.subpixel_var.get())
             _isz = self.vars["imgsz"].get().strip()
             self.cfg["imgsz"] = _isz if _isz.lower() == "auto" else int(_isz)
+            self.cfg["frames_avg"] = max(1, int(self.vars["frames_avg"].get()))
             self.cfg["tcp_enabled"] = bool(self.tcp_enabled_var.get())
             self.cfg["tcp_host"] = self.vars["tcp_host"].get() or "0.0.0.0"
             self.cfg["tcp_port"] = int(self.vars["tcp_port"].get())

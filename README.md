@@ -108,7 +108,8 @@ tabs:
   the detection **model** (FastSAM, a YOLO-seg, or a custom-trained `.pt` — a
   **Model type** selector picks the right loader) with a **sub-pixel circle
   fit** toggle for tighter diameters, plus `conf, iou, min/max_area_frac,
-  min_circ, min_radius_frac`, an optional **inner-diameter (hole)**
+  min_circ, min_radius_frac`, **frame averaging** (mean of N frames of a
+  stationary part, to cut noise), an optional **inner-diameter (hole)**
   measurement (best-effort, image-based), a **TCP server** (host/port/line
   format), and
   **output ordering** (sort rings by `y`, `x`, or `diameter`, asc/desc — sets
