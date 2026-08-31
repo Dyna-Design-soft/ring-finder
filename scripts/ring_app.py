@@ -80,6 +80,8 @@ DEFAULT_CONFIG = {
     "max_area_frac": 0.25,
     "min_circ": 0.75,
     "min_radius_frac": 0.03,
+    "clahe": True,                  # normalise local contrast before detect
+    "auto_retry": True,             # if 0 rings, retry once with relaxed params
     "measure_inner": False,         # also estimate inner diameter (hole) - best effort
     "inner_sat_thresh": 70,         # metal is below this saturation; hole above
     # ---- TCP server (sends robot XY to the controller) ----
@@ -627,22 +629,8 @@ class Detector:
         return self.model(img, device="cpu", imgsz=imgsz, conf=conf, iou=iou,
                           verbose=False)[0]
 
-    def find_rings(self, img, cfg):
-        H, W = img.shape[:2]
-        min_r = max(5, (H * W) ** 0.5 * float(cfg.get("min_radius_frac", 0.03)))
-        conf = float(cfg.get("conf", 0.20))
-        iou = float(cfg.get("iou", 0.7))
-        min_af = float(cfg.get("min_area_frac", 0.004))
-        max_af = float(cfg.get("max_area_frac", 0.25))
-        min_circ = float(cfg.get("min_circ", 0.75))
-        subpixel = bool(cfg.get("subpixel", True))
-        raw = cfg.get("imgsz", 640)
-        if str(raw).strip().lower() == "auto":
-            # match inference size to the input (multiple of 32, capped for CPU)
-            imgsz = int(min(1024, max(640, round(max(H, W) / 32.0) * 32)))
-        else:
-            imgsz = int(raw)
-        res = self._predict(img, conf, iou, imgsz)
+    def _extract(self, res, H, W, min_r, min_af, max_af, min_circ, subpixel):
+        """Turn a prediction into a list of (x, y, r) rings."""
         rings = []
 
         def add(x, y, r):
@@ -691,11 +679,60 @@ class Detector:
                         min(x2 - x1, y2 - y1) / 2.0)
         return sorted(rings, key=lambda t: (t[1], t[0]))
 
+    def find_rings(self, img, cfg):
+        H, W = img.shape[:2]
+        min_r = max(5, (H * W) ** 0.5 * float(cfg.get("min_radius_frac", 0.03)))
+        conf = float(cfg.get("conf", 0.20))
+        iou = float(cfg.get("iou", 0.7))
+        min_af = float(cfg.get("min_area_frac", 0.004))
+        max_af = float(cfg.get("max_area_frac", 0.25))
+        min_circ = float(cfg.get("min_circ", 0.75))
+        subpixel = bool(cfg.get("subpixel", True))
+        raw = cfg.get("imgsz", 640)
+        if str(raw).strip().lower() == "auto":
+            # match inference size to the input (multiple of 32, capped for CPU)
+            imgsz = int(min(1024, max(640, round(max(H, W) / 32.0) * 32)))
+        else:
+            imgsz = int(raw)
+        # normalise local contrast so a ring detects the same in a dark corner
+        # as in a bright centre (fed to the model only; geometry is unchanged).
+        det_img = apply_clahe(img) if bool(cfg.get("clahe", True)) else img
+
+        res = self._predict(det_img, conf, iou, imgsz)
+        rings = self._extract(res, H, W, min_r, min_af, max_af, min_circ, subpixel)
+
+        # position-dependent miss safety net: if nothing was found, retry once
+        # with a lower confidence, a larger inference size and a looser circle
+        # test before declaring the belt empty.
+        if not rings and bool(cfg.get("auto_retry", True)):
+            conf2 = max(0.03, conf * 0.4)
+            imgsz2 = int(min(1024, max(imgsz, 1024)))
+            res = self._predict(det_img, conf2, iou, imgsz2)
+            rings = self._extract(res, H, W, min_r, min_af, max_af,
+                                  min_circ * 0.8, subpixel)
+        return rings
+
 
 def sort_rings(rings, by="y", desc=False):
     """rings = [(x, y, r), ...]; sort by y | x | diameter."""
     idx = {"x": 0, "y": 1, "diameter": 2}.get(by, 1)
     return sorted(rings, key=lambda t: t[idx], reverse=bool(desc))
+
+
+_CLAHE = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+
+
+def apply_clahe(img):
+    """Even out brightness across the frame (CLAHE on the L channel) so a ring
+    in a dark corner has the same contrast as one in a bright centre. Returns a
+    BGR image; used only as detection input - display/measurement stay on the
+    original pixels."""
+    try:
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        lab[:, :, 0] = _CLAHE.apply(lab[:, :, 0])
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    except Exception:
+        return img
 
 
 def inner_radius(img, x, y, r, sat_thresh=70):
@@ -1316,6 +1353,21 @@ class App:
                         variable=self.subpixel_var).grid(
             row=r0, column=1, sticky=tk.W, pady=(6, 0))
         r0 += 1
+        self.clahe_var = tk.BooleanVar(value=bool(self.cfg.get("clahe", True)))
+        ttk.Checkbutton(t_det,
+                        text="Even out lighting before detect (CLAHE) - "
+                             "fixes rings missed in dark/corner positions",
+                        variable=self.clahe_var).grid(
+            row=r0, column=1, sticky=tk.W, pady=(6, 0))
+        r0 += 1
+        self.auto_retry_var = tk.BooleanVar(
+            value=bool(self.cfg.get("auto_retry", True)))
+        ttk.Checkbutton(t_det,
+                        text="Auto-retry if nothing found (lower conf, larger "
+                             "imgsz) before calling belt empty",
+                        variable=self.auto_retry_var).grid(
+            row=r0, column=1, sticky=tk.W, pady=(2, 0))
+        r0 += 1
         self._config_row(t_det, r0, "imgsz", "Inference size (imgsz)", "text")
         r0 += 1
         self._config_row(t_det, r0, "frames_avg", "Frame averaging (N frames)", "text")
@@ -1583,6 +1635,8 @@ class App:
             self.cfg["inner_sat_thresh"] = int(self.vars["inner_sat_thresh"].get())
             self.cfg["model_type"] = self.model_type_var.get() or "auto"
             self.cfg["subpixel"] = bool(self.subpixel_var.get())
+            self.cfg["clahe"] = bool(self.clahe_var.get())
+            self.cfg["auto_retry"] = bool(self.auto_retry_var.get())
             _isz = self.vars["imgsz"].get().strip()
             self.cfg["imgsz"] = _isz if _isz.lower() == "auto" else int(_isz)
             self.cfg["frames_avg"] = max(1, int(self.vars["frames_avg"].get()))
@@ -1619,6 +1673,8 @@ class App:
         self.measure_inner_var.set(bool(self.cfg.get("measure_inner")))
         self.model_type_var.set(self.cfg.get("model_type", "auto"))
         self.subpixel_var.set(bool(self.cfg.get("subpixel", True)))
+        self.clahe_var.set(bool(self.cfg.get("clahe", True)))
+        self.auto_retry_var.set(bool(self.cfg.get("auto_retry", True)))
 
     def save(self, announce=True):
         if not self._read_fields():
