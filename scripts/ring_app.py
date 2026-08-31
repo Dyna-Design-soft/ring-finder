@@ -1507,6 +1507,9 @@ class App:
                    command=self.calib_fit).pack(side=tk.LEFT)
         ttk.Button(row3, text="Coverage map",
                    command=self.calib_coverage).pack(side=tk.LEFT, padx=6)
+        self.cov_overlay_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row3, text="overlay on image",
+                        variable=self.cov_overlay_var).pack(side=tk.LEFT)
         self.calib_result = ttk.Label(right, text="", foreground="#333",
                                       wraplength=360, justify=tk.LEFT)
         self.calib_result.pack(fill=tk.X, pady=(6, 0))
@@ -1971,9 +1974,16 @@ class App:
             mask[yi, xi] = 0
         dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
         t = np.clip(dist / (0.20 * np.hypot(W, H)), 0, 1)      # 0 near .. 1 far
-        img = np.zeros((H, W, 3), np.uint8)
-        img[..., 1] = (150 * (1 - t)).astype(np.uint8)         # green = covered
-        img[..., 2] = (200 * t).astype(np.uint8)               # red = uncovered
+        heat = np.zeros((H, W, 3), np.uint8)
+        heat[..., 1] = (150 * (1 - t)).astype(np.uint8)        # green = covered
+        heat[..., 2] = (200 * t).astype(np.uint8)              # red = uncovered
+        # overlay the heat on the last captured calibration image, if wanted
+        base = getattr(self, "_calib_last_bgr", None)
+        if self.cov_overlay_var.get() and base is not None \
+                and base.shape[:2] == (H, W):
+            img = cv2.addWeighted(base, 0.55, heat, 0.55, 0)
+        else:
+            img = heat
         for (px, py), e in zip(P, err):
             col = (0, 230, 0) if e < 1 else ((0, 180, 255) if e < 2 else (0, 0, 255))
             cv2.circle(img, (int(px), int(py)), 6, col, -1)
@@ -2217,6 +2227,7 @@ class App:
         self._calib_rings = res["rings"]
         h, w = res["image"].shape[:2]
         self._calib_wh = (w, h)
+        self._calib_last_bgr = res["image"].copy()   # for coverage overlay
         try:
             self._calib_imgtk = self._to_tk(res["image"], (520, 430))
             self.calib_canvas.config(image=self._calib_imgtk)
