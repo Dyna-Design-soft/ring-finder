@@ -13,3 +13,4 @@ pillow
 # reading the robot_xy .xls (optional; only for robot_map.py if using .xls)
 pandas
 xlrd
+openpyxl              # read .xlsx calibration tables (batch calibration)

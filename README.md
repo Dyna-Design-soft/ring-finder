@@ -122,7 +122,10 @@ tabs:
   then press **Update** to copy the live value into the fields) → **Add
   point**; collect ≥4 points, then
   **Fit & Save** writes the map (with in-fit and leave-one-out RMS, and
-  RANSAC-flagged bad points). Choose the **Model**: `homography` (perspective,
+  RANSAC-flagged bad points). Or **Batch (folder + Excel)**: point it at a
+  folder of calibration images plus an Excel/CSV table (columns for **X**,
+  **Y**, **image name**) and it detects each ring, pairs it with the robot XY,
+  fits, and writes the calibration file automatically. Choose the **Model**: `homography` (perspective,
   8 DOF), `affine` (6 DOF), or `similarity` (rotation+uniform scale+translation
   via sin/cos, 4 DOF) - similarity is most robust when the camera views a flat
   plane squarely and often gives the lowest leave-one-out error.

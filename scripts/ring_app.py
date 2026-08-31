@@ -235,6 +235,51 @@ def save_config(cfg):
     json.dump(cfg, open(CONFIG_FILE, "w"), indent=2)
 
 
+def read_robot_table(path):
+    """Read a calibration table (.xlsx/.xls/.csv). Finds columns for X, Y and
+    image name by header keywords. Returns [(image_name, x, y), ...]."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".xlsx", ".xlsm", ".xls"):
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True)
+        data = [list(r) for r in wb.active.iter_rows(values_only=True)]
+    else:
+        with open(path, newline="") as f:
+            data = [r for r in csv.reader(f)]
+    # locate the header row (has an image/name column)
+    hdr_i = None
+    for i, row in enumerate(data):
+        cells = [str(c).lower() if c is not None else "" for c in row]
+        if any("image" in c or "name" in c for c in cells):
+            hdr_i = i
+            break
+    if hdr_i is None:
+        raise ValueError("no header row with an 'image/name' column found")
+    header = [str(c).lower() if c is not None else "" for c in data[hdr_i]]
+    xcol = ycol = imgcol = None
+    for j, h in enumerate(header):
+        if imgcol is None and ("image" in h or "name" in h):
+            imgcol = j
+        elif xcol is None and "x" in h:
+            xcol = j
+        elif ycol is None and "y" in h:
+            ycol = j
+    if None in (xcol, ycol, imgcol):
+        raise ValueError("could not find X / Y / image columns in the header")
+    out = []
+    for row in data[hdr_i + 1:]:
+        if imgcol >= len(row) or row[imgcol] in (None, ""):
+            continue
+        try:
+            out.append((str(row[imgcol]).strip(),
+                        float(row[xcol]), float(row[ycol])))
+        except (ValueError, TypeError):
+            continue
+    if not out:
+        raise ValueError("no data rows parsed")
+    return out
+
+
 def load_intrinsics(path):
     """Load camera_matrix + distortion from a calibrate.py calibration.json.
     Returns (K, dist) or (None, None)."""
@@ -741,6 +786,8 @@ class Worker(threading.Thread):
                 kind, path = self.jobs.get_nowait()
                 if kind == "calib":
                     self._calib(path)
+                elif kind == "batchcal":
+                    self._batchcal(path)
                 else:
                     self._process(path, allow_avg=False)   # on-demand: no averaging
                 continue
@@ -925,6 +972,71 @@ class Worker(threading.Thread):
             self.log("calib image %s -> %d ring(s)" % (name, len(rings)))
         except Exception as e:
             self.log("calib ERROR on %s: %s" % (name, e))
+
+    def _find_image(self, folder, name):
+        """Resolve an image name from the table (with or without extension)."""
+        if os.path.exists(os.path.join(folder, name)):
+            return os.path.join(folder, name)
+        for ext in (".bmp", ".png", ".jpg", ".jpeg", ".tif", ".tiff"):
+            p = os.path.join(folder, name + ext)
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _batchcal(self, folder):
+        """Batch calibration: read the table (xlsx/csv) in `folder`, detect the
+        ring in each named image, fit the transform and save the map."""
+        try:
+            tables = []
+            for ext in ("*.xlsx", "*.xls", "*.csv"):
+                tables += glob.glob(os.path.join(folder, ext))
+            if not tables:
+                self.q.put(("batchcal_result",
+                            {"error": "no .xlsx/.csv table found in the folder"}))
+                return
+            rows = read_robot_table(tables[0])
+            self.log("batch calibration: %d rows from %s"
+                     % (len(rows), os.path.basename(tables[0])))
+            pts, missing = [], []
+            for iname, rx, ry in rows:
+                path = self._find_image(folder, iname)
+                if path is None:
+                    missing.append("%s (no image)" % iname)
+                    continue
+                img = cv2.imread(path)
+                if img is None:
+                    missing.append("%s (unreadable)" % iname)
+                    continue
+                rings = self._detect_img(img)
+                if not rings:
+                    missing.append("%s (no ring)" % iname)
+                    continue
+                x, y, _ = max(rings, key=lambda t: t[2])   # largest ring
+                pts.append((x, y, rx, ry))
+                fw = (img.shape[1], img.shape[0])
+            need = 4 if self.cfg.get("calib_transform", "homography") == \
+                "homography" else 3
+            if len(pts) < need:
+                self.q.put(("batchcal_result",
+                            {"error": "only %d usable points (need >= %d)"
+                             % (len(pts), need), "missing": missing}))
+                return
+            K = dist = None
+            if self.cfg.get("undistort"):
+                K, dist = load_intrinsics(self.cfg.get("intrinsics_file", ""))
+            kind = self.cfg.get("calib_transform", "homography")
+            res = fit_transform(pts, kind, K=K, dist=dist, frame_wh=fw)
+            path = self.cfg.get("homography_file", "")
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            json.dump(res, open(path, "w"), indent=2)
+            res["_saved_to"] = path
+            res["_missing"] = missing
+            res["_table"] = os.path.basename(tables[0])
+            self.q.put(("batchcal_result", res))
+            self.log("batch calibration done: %d points, RMS %.2f mm, saved %s"
+                     % (res["points_used"], res["rms_mm"], os.path.basename(path)))
+        except Exception as e:
+            self.q.put(("batchcal_result", {"error": str(e)}))
 
     def _tcp_send(self, image, rings):
         if not self.tcp:
@@ -1280,6 +1392,8 @@ class App:
                    command=self.calib_grab).pack(side=tk.LEFT)
         ttk.Button(top, text="Load image...",
                    command=self.calib_load).pack(side=tk.LEFT, padx=6)
+        ttk.Button(top, text="Batch (folder + Excel)",
+                   command=self.calib_batch).pack(side=tk.LEFT, padx=(14, 0))
         ttk.Label(top, text="Detected ring:").pack(side=tk.LEFT, padx=(14, 2))
         self.calib_ring_sel = tk.Spinbox(top, from_=1, to=1, width=4)
         self.calib_ring_sel.pack(side=tk.LEFT)
@@ -1593,6 +1707,16 @@ class App:
         newest = max(files, key=os.path.getmtime)
         self.worker.submit(newest, "calib")
 
+    def calib_batch(self):
+        self._read_fields()          # so the map path / model / undistort are current
+        folder = filedialog.askdirectory(
+            title="Folder with calibration images + Excel/CSV",
+            initialdir=self.cfg.get("watch_folder", ROOT))
+        if not folder:
+            return
+        self._log("batch calibration from %s ..." % folder)
+        self.worker.submit(folder, "batchcal")
+
     def calib_load(self):
         f = filedialog.askopenfilename(
             initialdir=self.cfg.get("watch_folder", ROOT),
@@ -1837,6 +1961,8 @@ class App:
                     self._show(payload)
                 elif kind == "calib_result":
                     self._show_calib(payload)
+                elif kind == "batchcal_result":
+                    self._show_batchcal(payload)
                 elif kind == "robot_live":
                     x, y = payload
                     self.robot_live_lbl.config(
@@ -1944,6 +2070,36 @@ class App:
                 r["id"], r["x"], r["y"], r["diameter"],
                 r["robot_x"], r["robot_y"], r.get("diameter_mm", ""),
                 r.get("inner_dia", ""), r.get("inner_dia_mm", "")))
+
+    def _show_batchcal(self, res):
+        if res.get("error"):
+            miss = res.get("missing")
+            m = "Batch calibration failed:\n%s" % res["error"]
+            if miss:
+                m += "\nskipped: %s" % ", ".join(miss[:8])
+            messagebox.showerror("Batch calibration", m)
+            self.calib_result.config(text=m, foreground="#cf222e")
+            return
+        loo = ("%.2f" % res["loo_rms_mm"]) if res.get("loo_rms_mm") else "n/a"
+        msg = ("Batch calibration saved: %s\ntable: %s   points used: %d   "
+               "model: %s\nfit RMS: %.2f mm   LOO: %s mm"
+               % (os.path.basename(res["_saved_to"]), res.get("_table", "?"),
+                  res["points_used"], res.get("transform", "?"),
+                  res["rms_mm"], loo))
+        if res.get("angle_deg") is not None:
+            msg += "  (angle %.2f deg, scale %.4f mm/px)" % (
+                res["angle_deg"], res["scale_mm_px"])
+        if res.get("excluded"):
+            msg += "\nexcluded (check robot XY): %s" % res["excluded"]
+        if res.get("_missing"):
+            msg += "\nskipped %d image(s): %s" % (
+                len(res["_missing"]), ", ".join(res["_missing"][:6]))
+        if res.get("coverage_warning"):
+            msg += "\n[!] " + res["coverage_warning"]
+        self.calib_result.config(text=msg, foreground="#1a7f37")
+        self._refresh_map_info()
+        self._refresh_profiles()
+        messagebox.showinfo("Batch calibration", msg)
 
     def _show_calib(self, res):
         self._calib_rings = res["rings"]
