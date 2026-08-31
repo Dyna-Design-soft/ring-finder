@@ -544,15 +544,22 @@ class Detector:
         def add(x, y, r):
             if r < min_r:
                 return
-            if any((x - rx) ** 2 + (y - ry) ** 2 < (0.5 * max(r, rr)) ** 2
-                   for rx, ry, rr in rings):
-                return
+            # concentric detections (e.g. FastSAM giving the hole as well as the
+            # washer) -> keep the LARGER one so the outer diameter always wins.
+            for idx, (rx, ry, rr) in enumerate(rings):
+                if (x - rx) ** 2 + (y - ry) ** 2 < (0.6 * max(r, rr)) ** 2:
+                    if r > rr:
+                        rings[idx] = (x, y, r)
+                    return
             rings.append((x, y, r))
 
         masks = getattr(res, "masks", None)
         if masks is not None and masks.data is not None:
-            for m in masks.data.cpu().numpy():
-                mask = (m > 0.5).astype(np.uint8)
+            md = masks.data.cpu().numpy()
+            # largest area first, so an outer washer is added before its hole
+            order = sorted(range(len(md)), key=lambda k: -(md[k] > 0.5).sum())
+            for k in order:
+                mask = (md[k] > 0.5).astype(np.uint8)
                 a = int(mask.sum())
                 if a < min_af * H * W or a > max_af * H * W:
                     continue
