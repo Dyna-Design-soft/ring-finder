@@ -67,6 +67,7 @@ DEFAULT_CONFIG = {
     "intrinsics_file": os.path.join(ROOT, "config", "calibration.json"),  # optional
     "undistort": False,             # distortion-aware map (needs intrinsics_file)
     "calib_transform": "homography",  # homography | affine | similarity (sin/cos)
+    "batch_multi": "largest",         # if an image has >1 ring: largest|center|skip
     # ---- detection parameters ----
     "model": "FastSAM-x.pt",
     "model_type": "auto",           # auto | fastsam | yolo | sam
@@ -997,7 +998,8 @@ class Worker(threading.Thread):
             rows = read_robot_table(tables[0])
             self.log("batch calibration: %d rows from %s"
                      % (len(rows), os.path.basename(tables[0])))
-            pts, missing = [], []
+            strat = self.cfg.get("batch_multi", "largest")
+            pts, missing, multi = [], [], []
             for iname, rx, ry in rows:
                 path = self._find_image(folder, iname)
                 if path is None:
@@ -1011,9 +1013,22 @@ class Worker(threading.Thread):
                 if not rings:
                     missing.append("%s (no ring)" % iname)
                     continue
-                x, y, _ = max(rings, key=lambda t: t[2])   # largest ring
-                pts.append((x, y, rx, ry))
                 fw = (img.shape[1], img.shape[0])
+                if len(rings) > 1:
+                    multi.append("%s (%d)" % (iname, len(rings)))
+                    if strat == "skip":
+                        missing.append("%s (%d rings - skipped)"
+                                       % (iname, len(rings)))
+                        continue
+                    if strat == "center":     # ring nearest the image centre
+                        cx, cy = img.shape[1] / 2.0, img.shape[0] / 2.0
+                        x, y, _ = min(rings, key=lambda t: (t[0] - cx) ** 2
+                                      + (t[1] - cy) ** 2)
+                    else:                     # largest
+                        x, y, _ = max(rings, key=lambda t: t[2])
+                else:
+                    x, y, _ = rings[0]
+                pts.append((x, y, rx, ry))
             need = 4 if self.cfg.get("calib_transform", "homography") == \
                 "homography" else 3
             if len(pts) < need:
@@ -1031,6 +1046,8 @@ class Worker(threading.Thread):
             json.dump(res, open(path, "w"), indent=2)
             res["_saved_to"] = path
             res["_missing"] = missing
+            res["_multi"] = multi
+            res["_multi_strategy"] = strat
             res["_table"] = os.path.basename(tables[0])
             self.q.put(("batchcal_result", res))
             self.log("batch calibration done: %d points, RMS %.2f mm, saved %s"
@@ -1394,6 +1411,12 @@ class App:
                    command=self.calib_load).pack(side=tk.LEFT, padx=6)
         ttk.Button(top, text="Batch (folder + Excel)",
                    command=self.calib_batch).pack(side=tk.LEFT, padx=(14, 0))
+        self.batch_multi_var = tk.StringVar(
+            value=self.cfg.get("batch_multi", "largest"))
+        ttk.Label(top, text="if many rings:").pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Combobox(top, textvariable=self.batch_multi_var, width=8,
+                     state="readonly",
+                     values=["largest", "center", "skip"]).pack(side=tk.LEFT)
         ttk.Label(top, text="Detected ring:").pack(side=tk.LEFT, padx=(14, 2))
         self.calib_ring_sel = tk.Spinbox(top, from_=1, to=1, width=4)
         self.calib_ring_sel.pack(side=tk.LEFT)
@@ -1709,6 +1732,7 @@ class App:
 
     def calib_batch(self):
         self._read_fields()          # so the map path / model / undistort are current
+        self.cfg["batch_multi"] = self.batch_multi_var.get() or "largest"
         folder = filedialog.askdirectory(
             title="Folder with calibration images + Excel/CSV",
             initialdir=self.cfg.get("watch_folder", ROOT))
@@ -2091,6 +2115,10 @@ class App:
                 res["angle_deg"], res["scale_mm_px"])
         if res.get("excluded"):
             msg += "\nexcluded (check robot XY): %s" % res["excluded"]
+        if res.get("_multi"):
+            msg += "\n[!] %d image(s) had MULTIPLE rings (used '%s'): %s" % (
+                len(res["_multi"]), res.get("_multi_strategy", "largest"),
+                ", ".join(res["_multi"][:6]))
         if res.get("_missing"):
             msg += "\nskipped %d image(s): %s" % (
                 len(res["_missing"]), ", ".join(res["_missing"][:6]))

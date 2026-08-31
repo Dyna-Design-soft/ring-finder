@@ -125,7 +125,10 @@ tabs:
   RANSAC-flagged bad points). Or **Batch (folder + Excel)**: point it at a
   folder of calibration images plus an Excel/CSV table (columns for **X**,
   **Y**, **image name**) and it detects each ring, pairs it with the robot XY,
-  fits, and writes the calibration file automatically. Choose the **Model**: `homography` (perspective,
+  fits, and writes the calibration file automatically. A calibration image
+  should hold **one** ring; if any has several, an **if many rings** selector
+  chooses `largest` / `center` (nearest image centre) / `skip`, and the run
+  reports which images had multiples. Choose the **Model**: `homography` (perspective,
   8 DOF), `affine` (6 DOF), or `similarity` (rotation+uniform scale+translation
   via sin/cos, 4 DOF) - similarity is most robust when the camera views a flat
   plane squarely and often gives the lowest leave-one-out error.
