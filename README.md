@@ -121,8 +121,11 @@ tabs:
   request command like `STP` and parses `X=xx.xx,Y=yy.yy`, showing it live —
   then press **Update** to copy the live value into the fields) → **Add
   point**; collect ≥4 points, then
-  **Fit & Save** writes the homography file (with in-fit and leave-one-out
-  RMS, and RANSAC-flagged bad points).
+  **Fit & Save** writes the map (with in-fit and leave-one-out RMS, and
+  RANSAC-flagged bad points). Choose the **Model**: `homography` (perspective,
+  8 DOF), `affine` (6 DOF), or `similarity` (rotation+uniform scale+translation
+  via sin/cos, 4 DOF) - similarity is most robust when the camera views a flat
+  plane squarely and often gives the lowest leave-one-out error.
 
   Buttons: **Save settings**, **Save & Restart** / **Restart app** (relaunch
   so a new model reloads), and **Export config… / Import config…** (share a

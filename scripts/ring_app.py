@@ -66,6 +66,7 @@ DEFAULT_CONFIG = {
     "homography_file": os.path.join(ROOT, "config", "robot_map.json"),
     "intrinsics_file": os.path.join(ROOT, "config", "calibration.json"),  # optional
     "undistort": False,             # distortion-aware map (needs intrinsics_file)
+    "calib_transform": "homography",  # homography | affine | similarity (sin/cos)
     # ---- detection parameters ----
     "model": "FastSAM-x.pt",
     "model_type": "auto",           # auto | fastsam | yolo | sam
@@ -247,14 +248,22 @@ def load_intrinsics(path):
 
 
 def load_mapper(path):
-    """Load a pixel->robot map. Returns dict {H, K, dist} or None. K/dist are
-    present when the map was fitted distortion-aware (points undistorted)."""
+    """Load a pixel->robot map. Returns dict {H|M, K, dist} or None. 'H' is a
+    3x3 homography; 'M' is a 2x3 affine/similarity. K/dist present when the map
+    is distortion-aware."""
     try:
         d = json.load(open(path))
-        H = np.array(d["H"], np.float64)
-        K = np.array(d["K"], np.float64) if d.get("K") else None
-        dist = np.array(d["dist"], np.float64) if d.get("dist") is not None else None
-        return {"H": H, "K": K, "dist": dist}
+        m = {"H": None, "M": None,
+             "K": np.array(d["K"], np.float64) if d.get("K") else None,
+             "dist": np.array(d["dist"], np.float64)
+             if d.get("dist") is not None else None}
+        if d.get("M") is not None:
+            m["M"] = np.array(d["M"], np.float64)      # affine / similarity
+        elif d.get("H") is not None:
+            m["H"] = np.array(d["H"], np.float64)      # homography
+        else:
+            return None
+        return m
     except Exception:
         return None
 
@@ -266,52 +275,88 @@ def _undistort(pts, mapper):
     return pts
 
 
+def _apply_map(mapper, pts_1x1x2):
+    """Apply the map (H or M) to undistorted points (N,1,2) -> (N,2)."""
+    if mapper.get("M") is not None:
+        M = mapper["M"]
+        p = pts_1x1x2.reshape(-1, 2)
+        return (p @ M[:, :2].T) + M[:, 2]
+    return cv2.perspectiveTransform(pts_1x1x2, mapper["H"]).reshape(-1, 2)
+
+
 def map_point(mapper, x, y):
     """Pixel (x, y) -> robot (X, Y) mm (undistorts first if intrinsics present)."""
-    pt = _undistort([(x, y)], mapper)
-    q = cv2.perspectiveTransform(pt, mapper["H"]).reshape(2)
+    q = _apply_map(mapper, _undistort([(x, y)], mapper))[0]
     return float(q[0]), float(q[1])
 
 
 def map_diameter_mm(mapper, x, y, r):
     """Outer diameter in mm: map opposite rim points and average."""
-    rim = _undistort([(x + r, y), (x - r, y), (x, y + r), (x, y - r)], mapper)
-    mm = cv2.perspectiveTransform(rim, mapper["H"]).reshape(-1, 2)
+    mm = _apply_map(mapper,
+                    _undistort([(x + r, y), (x - r, y), (x, y + r), (x, y - r)],
+                               mapper))
     return 0.5 * (float(np.linalg.norm(mm[0] - mm[1])) +
                   float(np.linalg.norm(mm[2] - mm[3])))
 
 
-def fit_homography(points, ransac_mm=6.0, K=None, dist=None, frame_wh=None):
-    """points = [(px, py, robot_x, robot_y), ...] -> dict with H + stats.
-    If K/dist given, the pixel points are undistorted first (distortion-aware)
-    and K/dist are embedded in the result so runtime undistorts identically.
-    Raises ValueError if fewer than 4 points."""
-    if len(points) < 4:
-        raise ValueError("need at least 4 points, have %d" % len(points))
+def _estimate_transform(P, R, kind, thr, robust=True):
+    """Fit pixel->robot transform. kind: homography | affine | similarity.
+    Returns (key, matrix, mask) where key is 'H' (3x3) or 'M' (2x3)."""
+    if kind == "homography":
+        M, mask = cv2.findHomography(P, R, cv2.RANSAC if robust else 0, thr)
+        return "H", M, mask
+    method = cv2.RANSAC if robust else cv2.LMEDS
+    if kind == "affine":
+        M, mask = cv2.estimateAffine2D(P, R, method=method,
+                                       ransacReprojThreshold=thr)
+    else:                                   # similarity: rotation+scale+trans
+        M, mask = cv2.estimateAffinePartial2D(P, R, method=method,
+                                              ransacReprojThreshold=thr)
+    return "M", M, mask
+
+
+def _apply_transform(key, M, P):
+    if key == "H":
+        return cv2.perspectiveTransform(P.reshape(-1, 1, 2), M).reshape(-1, 2)
+    return (P @ M[:, :2].T) + M[:, 2]
+
+
+def fit_transform(points, kind="homography", ransac_mm=6.0, K=None, dist=None,
+                  frame_wh=None):
+    """points = [(px, py, robot_x, robot_y), ...] -> map dict + stats.
+    kind: 'homography' (perspective), 'affine' (scale/shear/rot/trans) or
+    'similarity' (rotation+uniform scale+translation, i.e. sin/cos - best when
+    the camera views a flat plane squarely). Raises ValueError if too few
+    points (homography needs >=4; affine/similarity >=3)."""
+    need = 4 if kind == "homography" else 3
+    if len(points) < need:
+        raise ValueError("need at least %d points, have %d" % (need, len(points)))
     P = np.array([[p[0], p[1]] for p in points], np.float64)
     R = np.array([[p[2], p[3]] for p in points], np.float64)
     if K is not None and dist is not None:
         P = cv2.undistortPoints(P.reshape(-1, 1, 2), K, dist, P=K).reshape(-1, 2)
-    H, mask = cv2.findHomography(P, R, cv2.RANSAC, ransac_mm)
-    if H is None:
-        raise ValueError("homography fit failed")
-    inl = [i for i in range(len(points)) if mask[i]]
-    if len(inl) < 4:
-        inl = list(range(len(points)))          # fall back to all
-    Pi, Ri = P[inl], R[inl]
-    H, _ = cv2.findHomography(Pi, Ri, 0)
-    proj = cv2.perspectiveTransform(Pi.reshape(-1, 1, 2), H).reshape(-1, 2)
-    res = np.linalg.norm(proj - Ri, axis=1)
+    key, M, mask = _estimate_transform(P, R, kind, ransac_mm, robust=True)
+    if M is None:
+        raise ValueError("%s fit failed" % kind)
+    mask = mask.ravel() if mask is not None else np.ones(len(P))
+    inl = [i for i in range(len(P)) if mask[i]]
+    if len(inl) < need:
+        inl = list(range(len(P)))
+    # deterministic refit on inliers
+    key, M, _ = _estimate_transform(P[inl], R[inl], kind, ransac_mm, robust=False)
+    proj = _apply_transform(key, M, P[inl])
+    res = np.linalg.norm(proj - R[inl], axis=1)
     loo = None
-    if len(inl) >= 5:
+    if len(inl) >= need + 1:
         errs = []
         for h in inl:
             tr = [i for i in inl if i != h]
-            Hh, _ = cv2.findHomography(P[tr], R[tr], 0)
-            q = cv2.perspectiveTransform(P[h].reshape(-1, 1, 2), Hh).reshape(2)
+            k2, M2, _ = _estimate_transform(P[tr], R[tr], kind, ransac_mm,
+                                            robust=False)
+            q = _apply_transform(k2, M2, P[h].reshape(1, 2))[0]
             errs.append(float(np.linalg.norm(q - R[h])))
         loo = float(np.sqrt(np.mean(np.square(errs))))
-    # coverage: warn if the calibration points are nearly collinear / clustered
+    # coverage warning
     warn = None
     Pin = np.array([[points[i][0], points[i][1]] for i in inl], np.float64)
     c = Pin - Pin.mean(axis=0)
@@ -328,8 +373,8 @@ def fit_homography(points, ransac_mm=6.0, K=None, dist=None, frame_wh=None):
                     "the frame) - spread them out and toward the corners"
                     % (100 * xr / frame_wh[0], 100 * yr / frame_wh[1]))
     result = {
-        "type": "homography_px_to_robot_mm",
-        "H": H.tolist(),
+        "type": "px_to_robot_mm",
+        "transform": kind,
         "points_used": len(inl),
         "excluded": [i + 1 for i in range(len(points)) if i not in inl],
         "rms_mm": float(np.sqrt((res ** 2).mean())),
@@ -339,10 +384,21 @@ def fit_homography(points, ransac_mm=6.0, K=None, dist=None, frame_wh=None):
                     "robot_x": p[2], "robot_y": p[3]}
                    for i, p in enumerate(points)],
     }
+    if key == "H":
+        result["H"] = M.tolist()
+    else:
+        result["M"] = M.tolist()
+        result["angle_deg"] = float(np.degrees(np.arctan2(M[1, 0], M[0, 0])))
+        result["scale_mm_px"] = float(np.hypot(M[0, 0], M[1, 0]))
     if K is not None and dist is not None:
         result["K"] = K.tolist()
         result["dist"] = dist.ravel().tolist()
     return result
+
+
+def fit_homography(points, ransac_mm=6.0, K=None, dist=None, frame_wh=None):
+    """Backward-compatible wrapper -> homography."""
+    return fit_transform(points, "homography", ransac_mm, K, dist, frame_wh)
 
 
 # ---------------- TCP server ----------------
@@ -1255,6 +1311,13 @@ class App:
         self.undistort_var = tk.BooleanVar(value=bool(self.cfg.get("undistort")))
         ttk.Checkbutton(prof, text="distortion-aware",
                         variable=self.undistort_var).pack(side=tk.RIGHT)
+        self.transform_var = tk.StringVar(
+            value=self.cfg.get("calib_transform", "homography"))
+        ttk.Combobox(prof, textvariable=self.transform_var, width=12,
+                     state="readonly",
+                     values=["homography", "affine", "similarity"]).pack(
+            side=tk.RIGHT, padx=6)
+        ttk.Label(prof, text="Model").pack(side=tk.RIGHT)
 
         # live robot position over TCP
         livef = ttk.Frame(right)
@@ -1340,7 +1403,9 @@ class App:
         path = self.vars["homography_file"].get()
         try:
             d = json.load(open(path))
-            info = "map OK" if d.get("H") else "no H in file"
+            has = d.get("H") is not None or d.get("M") is not None
+            info = ("map OK [%s]" % d.get("transform", "homography")) if has \
+                else "no transform in file"
             if d.get("rms_mm") is not None:
                 info += "  |  fit RMS %.2f mm" % d["rms_mm"]
             if d.get("loo_rms_mm") is not None:
@@ -1405,6 +1470,7 @@ class App:
         self.sort_desc_var.set(bool(self.cfg.get("sort_desc")))
         self.auto_start_var.set(bool(self.cfg.get("auto_start", True)))
         self.undistort_var.set(bool(self.cfg.get("undistort")))
+        self.transform_var.set(self.cfg.get("calib_transform", "homography"))
         self.measure_inner_var.set(bool(self.cfg.get("measure_inner")))
         self.model_type_var.set(self.cfg.get("model_type", "auto"))
         self.subpixel_var.set(bool(self.cfg.get("subpixel", True)))
@@ -1702,9 +1768,10 @@ class App:
                     "invalid.\nFitting without undistortion.")
             else:
                 note = "  (distortion-aware)"
+        kind = self.transform_var.get() or "homography"
         try:
-            result = fit_homography(self.points, K=K, dist=dist,
-                                    frame_wh=getattr(self, "_calib_wh", None))
+            result = fit_transform(self.points, kind, K=K, dist=dist,
+                                   frame_wh=getattr(self, "_calib_wh", None))
         except ValueError as e:
             messagebox.showerror("Cannot fit", str(e))
             return
@@ -1719,6 +1786,10 @@ class App:
         msg = ("Saved %s%s\npoints used: %d   fit RMS: %.2f mm   LOO: %s mm"
                % (os.path.basename(path), note, result["points_used"],
                   result["rms_mm"], loo))
+        msg += "\nmodel: %s" % kind
+        if "angle_deg" in result:
+            msg += "  (angle %.2f deg, scale %.4f mm/px)" % (
+                result["angle_deg"], result["scale_mm_px"])
         if result["excluded"]:
             msg += "\nexcluded (check robot XY): %s" % result["excluded"]
         if result.get("coverage_warning"):
@@ -1726,7 +1797,9 @@ class App:
         self.calib_result.config(text=msg, foreground="#1a7f37")
         self._refresh_map_info()
         self._refresh_profiles()
-        messagebox.showinfo("Homography saved", msg)
+        self.cfg["calib_transform"] = kind
+        save_config(self.cfg)
+        messagebox.showinfo("Calibration saved", msg)
 
     def on_close(self):
         self.worker.stop_flag.set()
