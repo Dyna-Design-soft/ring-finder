@@ -84,6 +84,7 @@ DEFAULT_CONFIG = {
     "auto_retry": True,             # if 0 rings, retry once with relaxed params
     "multiscale": True,             # detect at several imgsz and merge (robust)
     "multiscale_sizes": "512,640,768",  # inference sizes used when multiscale on
+    "refine_od": True,              # snap circle to the true outer metal edge
     "measure_inner": False,         # also estimate inner diameter (hole) - best effort
     "inner_sat_thresh": 70,         # metal is below this saturation; hole above
     # ---- TCP server (sends robot XY to the controller) ----
@@ -735,6 +736,14 @@ class Detector:
             res = self._predict(det_img, conf2, iou, max(sizes))
             rings = self._extract(res, H, W, min_r, min_af, max_af,
                                   min_circ * 0.8, subpixel)
+
+        # snap each circle to the true outer metal edge so a thin washer reports
+        # its OD, not the inner hole (measured on the ORIGINAL, un-CLAHE pixels).
+        if rings and bool(cfg.get("refine_od", True)):
+            gray = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                                    .astype(np.float32), (3, 3), 0)
+            rings = [(x, y, refine_outer_radius(gray, x, y, r))
+                     for (x, y, r) in rings]
         return sorted(rings, key=lambda t: (t[1], t[0]))
 
 
@@ -758,6 +767,47 @@ def apply_clahe(img):
         return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
     except Exception:
         return img
+
+
+def refine_outer_radius(gray, cx, cy, r0):
+    """Snap a detected radius to the true OUTER metal edge (OD).
+
+    FastSAM sometimes segments the inner disc / mid-wall of a thin washer, so
+    the circle lands on the hole (ID) instead of the outside. We take the mean
+    intensity around the ring at increasing radius and pick the OUTERMOST strong
+    edge (largest |gradient|) in a band around r0 - that is where the metal meets
+    the belt. Polarity-independent (works whether metal is brighter or darker).
+    Returns the refined radius, or r0 unchanged when there is no clear edge."""
+    H, W = gray.shape[:2]
+    rs = np.arange(max(4.0, 0.55 * r0), 1.55 * r0, 0.5)
+    if len(rs) < 6:
+        return r0
+    th = np.linspace(0, 2 * np.pi, 240, endpoint=False)
+    ct, st = np.cos(th), np.sin(th)
+    prof = []
+    for rr in rs:
+        xs = cx + rr * ct
+        ys = cy + rr * st
+        ok = (xs >= 0) & (xs < W - 1) & (ys >= 0) & (ys < H - 1)
+        prof.append(gray[ys[ok].astype(int), xs[ok].astype(int)].mean()
+                    if ok.any() else 0.0)
+    prof = np.array(prof)
+    g = np.abs(np.gradient(prof))
+    gmax = float(g.max())
+    if gmax < 2.0:                       # no real edge -> trust the detection
+        return r0
+    strong = np.where(g >= 0.45 * gmax)[0]
+    if len(strong) == 0:
+        return r0
+    i = int(strong[-1])                  # outermost strong edge = outer metal edge
+    if 0 < i < len(g) - 1:               # parabolic sub-sample
+        a, b, c = g[i - 1], g[i], g[i + 1]
+        d = a - 2 * b + c
+        off = 0.5 * (a - c) / d if abs(d) > 1e-6 else 0.0
+    else:
+        off = 0.0
+    rod = float(rs[i] + off * (rs[1] - rs[0]))
+    return rod if 0.7 * r0 <= rod <= 1.55 * r0 else r0
 
 
 def inner_radius(img, x, y, r, sat_thresh=70):
@@ -1389,6 +1439,14 @@ class App:
         self._config_row(t_det, r0, "multiscale_sizes",
                          "Multi-scale sizes (comma)", "text")
         r0 += 1
+        self.refine_od_var = tk.BooleanVar(
+            value=bool(self.cfg.get("refine_od", True)))
+        ttk.Checkbutton(t_det,
+                        text="Snap to outer edge (OD) - fixes thin rings "
+                             "measured as the inner hole (ID)",
+                        variable=self.refine_od_var).grid(
+            row=r0, column=1, sticky=tk.W, pady=(2, 0))
+        r0 += 1
         self.auto_retry_var = tk.BooleanVar(
             value=bool(self.cfg.get("auto_retry", True)))
         ttk.Checkbutton(t_det,
@@ -1676,6 +1734,7 @@ class App:
             self.cfg["multiscale"] = bool(self.multiscale_var.get())
             self.cfg["multiscale_sizes"] = (
                 self.vars["multiscale_sizes"].get().strip() or "512,640,768")
+            self.cfg["refine_od"] = bool(self.refine_od_var.get())
             _isz = self.vars["imgsz"].get().strip()
             self.cfg["imgsz"] = _isz if _isz.lower() == "auto" else int(_isz)
             self.cfg["frames_avg"] = max(1, int(self.vars["frames_avg"].get()))
@@ -1715,6 +1774,7 @@ class App:
         self.clahe_var.set(bool(self.cfg.get("clahe", False)))
         self.auto_retry_var.set(bool(self.cfg.get("auto_retry", True)))
         self.multiscale_var.set(bool(self.cfg.get("multiscale", True)))
+        self.refine_od_var.set(bool(self.cfg.get("refine_od", True)))
 
     def save(self, announce=True):
         if not self._read_fields():
