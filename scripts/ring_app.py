@@ -304,11 +304,13 @@ def load_mapper(path):
     is distortion-aware."""
     try:
         d = json.load(open(path))
-        m = {"H": None, "M": None,
+        m = {"H": None, "M": None, "TPS": None,
              "K": np.array(d["K"], np.float64) if d.get("K") else None,
              "dist": np.array(d["dist"], np.float64)
              if d.get("dist") is not None else None}
-        if d.get("M") is not None:
+        if d.get("TPS") is not None:
+            m["TPS"] = d["TPS"]                         # bendable thin-plate spline
+        elif d.get("M") is not None:
             m["M"] = np.array(d["M"], np.float64)      # affine / similarity
         elif d.get("H") is not None:
             m["H"] = np.array(d["H"], np.float64)      # homography
@@ -327,7 +329,9 @@ def _undistort(pts, mapper):
 
 
 def _apply_map(mapper, pts_1x1x2):
-    """Apply the map (H or M) to undistorted points (N,1,2) -> (N,2)."""
+    """Apply the map (TPS, H or M) to undistorted points (N,1,2) -> (N,2)."""
+    if mapper.get("TPS") is not None:
+        return _tps_apply(mapper["TPS"], pts_1x1x2.reshape(-1, 2))
     if mapper.get("M") is not None:
         M = mapper["M"]
         p = pts_1x1x2.reshape(-1, 2)
@@ -379,6 +383,20 @@ def fit_transform(points, kind="homography", ransac_mm=6.0, K=None, dist=None,
     'similarity' (rotation+uniform scale+translation, i.e. sin/cos - best when
     the camera views a flat plane squarely). Raises ValueError if too few
     points (homography needs >=4; affine/similarity >=3)."""
+    if kind == "tps":
+        # bendable data-driven map; small default smoothing keeps a single
+        # mistyped point from warping it. Undistort first if intrinsics given.
+        if K is not None and dist is not None:
+            und = cv2.undistortPoints(
+                np.array([[p[0], p[1]] for p in points], np.float64)
+                .reshape(-1, 1, 2), K, dist, P=K).reshape(-1, 2)
+            points = [(und[i][0], und[i][1], points[i][2], points[i][3])
+                      for i in range(len(points))]
+        result = _fit_tps_result(points, lam=0.3, frame_wh=frame_wh)
+        if K is not None and dist is not None:
+            result["K"] = K.tolist()
+            result["dist"] = dist.ravel().tolist()
+        return result
     need = 4 if kind == "homography" else 3
     if len(points) < need:
         raise ValueError("need at least %d points, have %d" % (need, len(points)))
@@ -451,6 +469,110 @@ def fit_transform(points, kind="homography", ransac_mm=6.0, K=None, dist=None,
 def fit_homography(points, ransac_mm=6.0, K=None, dist=None, frame_wh=None):
     """Backward-compatible wrapper -> homography."""
     return fit_transform(points, "homography", ransac_mm, K, dist, frame_wh)
+
+
+# ---------------- thin-plate spline (bendable) mapping ----------------
+# A TPS map passes (near) exactly through every calibration point and bends
+# smoothly between them, so it can follow lens curvature / perspective that a
+# single straight-line (similarity/affine/homography) map cannot. Adding an
+# edge point then improves that edge WITHOUT lifting the map off the centre.
+
+def _tps_kernel(d2):
+    """U(r) = r^2 * log(r) evaluated from squared distance d2 (0 at r=0)."""
+    out = np.zeros_like(d2)
+    nz = d2 > 1e-12
+    out[nz] = 0.5 * d2[nz] * np.log(d2[nz])       # r^2 log r = 0.5 r^2 log(r^2)
+    return out
+
+
+def _tps_solve(ctrl, vals, lam):
+    """Solve one TPS (control points ctrl Nx2 -> scalar vals N). lam >= 0 is a
+    relative smoothing (0 = exact interpolation). Returns (weights N, affine 3)."""
+    n = len(ctrl)
+    d2 = ((ctrl[:, None, :] - ctrl[None, :, :]) ** 2).sum(-1)
+    K = _tps_kernel(d2)
+    if lam > 0 and n > 1:                          # scale-invariant smoothing
+        off = np.abs(K[~np.eye(n, dtype=bool)])    # kernel diag is 0, use off-diag
+        scale = float(off.mean()) if off.size else 1.0
+        K = K + lam * scale * np.eye(n)
+    Pm = np.hstack([np.ones((n, 1)), ctrl])       # N x 3  (1, x, y)
+    L = np.zeros((n + 3, n + 3))
+    L[:n, :n] = K
+    L[:n, n:] = Pm
+    L[n:, :n] = Pm.T
+    rhs = np.concatenate([vals, np.zeros(3)])
+    sol = np.linalg.lstsq(L, rhs, rcond=None)[0]
+    return sol[:n], sol[n:]
+
+
+def _tps_fit(P, R, lam):
+    """Fit a 2D->2D TPS: pixel P (Nx2) -> robot R (Nx2). Returns a param dict."""
+    wx, ax = _tps_solve(P, R[:, 0], lam)
+    wy, ay = _tps_solve(P, R[:, 1], lam)
+    return {"ctrl": P.tolist(), "wx": wx.tolist(), "ax": ax.tolist(),
+            "wy": wy.tolist(), "ay": ay.tolist(), "lam": float(lam)}
+
+
+def _tps_apply(tps, pts):
+    """Apply a TPS param dict to query points pts (Nx2) -> (Nx2)."""
+    ctrl = np.asarray(tps["ctrl"], np.float64)
+    pts = np.asarray(pts, np.float64).reshape(-1, 2)
+    d2 = ((pts[:, None, :] - ctrl[None, :, :]) ** 2).sum(-1)
+    U = _tps_kernel(d2)                           # M x N
+    Pm = np.hstack([np.ones((len(pts), 1)), pts])
+    x = U @ np.asarray(tps["wx"]) + Pm @ np.asarray(tps["ax"])
+    y = U @ np.asarray(tps["wy"]) + Pm @ np.asarray(tps["ay"])
+    return np.column_stack([x, y])
+
+
+def _fit_tps_result(points, lam, frame_wh):
+    """Build the map dict + honest stats (RMS and leave-one-out) for a TPS."""
+    if len(points) < 4:
+        raise ValueError("thin-plate spline needs at least 4 points, have %d"
+                         % len(points))
+    P = np.array([[p[0], p[1]] for p in points], np.float64)
+    R = np.array([[p[2], p[3]] for p in points], np.float64)
+    tps = _tps_fit(P, R, lam)
+    proj = _tps_apply(tps, P)
+    res = np.linalg.norm(proj - R, axis=1)
+    loo = None
+    if len(points) >= 5:
+        errs = []
+        for h in range(len(points)):
+            keep = [i for i in range(len(points)) if i != h]
+            t2 = _tps_fit(P[keep], R[keep], lam)
+            q = _tps_apply(t2, P[h:h + 1])[0]
+            errs.append(float(np.linalg.norm(q - R[h])))
+        loo = float(np.sqrt(np.mean(np.square(errs))))
+    # coverage warning (same spread check as the linear fits)
+    warn = None
+    c = P - P.mean(axis=0)
+    ev = np.linalg.eigvalsh(np.cov(c.T)) if len(P) >= 2 else np.array([1.0, 1.0])
+    ratio = float(ev.min() / ev.max()) if ev.max() > 0 else 0.0
+    if ratio < 0.05:
+        warn = ("calibration points are nearly collinear - spread them across "
+                "the whole frame for a reliable map")
+    elif frame_wh:
+        xr = float(P[:, 0].max() - P[:, 0].min())
+        yr = float(P[:, 1].max() - P[:, 1].min())
+        if xr < 0.30 * frame_wh[0] or yr < 0.30 * frame_wh[1]:
+            warn = ("calibration points are clustered - a bendable map is only "
+                    "accurate where you placed points; add points near the "
+                    "edges/corners you care about")
+    return {
+        "type": "px_to_robot_mm",
+        "transform": "tps",
+        "points_used": len(points),
+        "excluded": [],
+        "rms_mm": float(np.sqrt((res ** 2).mean())),
+        "loo_rms_mm": loo,
+        "coverage_warning": warn,
+        "frame_wh": list(frame_wh) if frame_wh else None,
+        "points": [{"id": i + 1, "px": p[0], "py": p[1],
+                    "robot_x": p[2], "robot_y": p[3]}
+                   for i, p in enumerate(points)],
+        "TPS": tps,
+    }
 
 
 # ---------------- TCP server ----------------
@@ -1149,8 +1271,8 @@ class Worker(threading.Thread):
                 else:
                     x, y, _ = rings[0]
                 pts.append((x, y, rx, ry))
-            need = 4 if self.cfg.get("calib_transform", "homography") == \
-                "homography" else 3
+            need = 3 if self.cfg.get("calib_transform", "homography") in \
+                ("affine", "similarity") else 4
             if len(pts) < need:
                 self.q.put(("batchcal_result",
                             {"error": "only %d usable points (need >= %d)"
@@ -1606,7 +1728,7 @@ class App:
             value=self.cfg.get("calib_transform", "homography"))
         ttk.Combobox(prof, textvariable=self.transform_var, width=12,
                      state="readonly",
-                     values=["homography", "affine", "similarity"]).pack(
+                     values=["similarity", "affine", "homography", "tps"]).pack(
             side=tk.RIGHT, padx=6)
         ttk.Label(prof, text="Model").pack(side=tk.RIGHT)
 
@@ -1701,7 +1823,8 @@ class App:
         path = self.vars["homography_file"].get()
         try:
             d = json.load(open(path))
-            has = d.get("H") is not None or d.get("M") is not None
+            has = (d.get("H") is not None or d.get("M") is not None
+                   or d.get("TPS") is not None)
             info = ("map OK [%s]" % d.get("transform", "homography")) if has \
                 else "no transform in file"
             if d.get("rms_mm") is not None:
@@ -1959,10 +2082,10 @@ class App:
 
     @staticmethod
     def _is_map_file(path):
-        """True if the JSON looks like a calibration map (has H or M)."""
+        """True if the JSON looks like a calibration map (has H, M or TPS)."""
         try:
             d = json.load(open(path))
-            return isinstance(d, dict) and ("H" in d or "M" in d)
+            return isinstance(d, dict) and ("H" in d or "M" in d or "TPS" in d)
         except Exception:
             return False
 
