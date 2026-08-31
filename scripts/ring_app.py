@@ -80,8 +80,10 @@ DEFAULT_CONFIG = {
     "max_area_frac": 0.25,
     "min_circ": 0.75,
     "min_radius_frac": 0.03,
-    "clahe": True,                  # normalise local contrast before detect
+    "clahe": False,                 # normalise local contrast before detect
     "auto_retry": True,             # if 0 rings, retry once with relaxed params
+    "multiscale": True,             # detect at several imgsz and merge (robust)
+    "multiscale_sizes": "512,640,768",  # inference sizes used when multiscale on
     "measure_inner": False,         # also estimate inner diameter (hole) - best effort
     "inner_sat_thresh": 70,         # metal is below this saturation; hole above
     # ---- TCP server (sends robot XY to the controller) ----
@@ -679,6 +681,31 @@ class Detector:
                         min(x2 - x1, y2 - y1) / 2.0)
         return sorted(rings, key=lambda t: (t[1], t[0]))
 
+    @staticmethod
+    def _merge(rings):
+        """Union rings from several passes, keeping the LARGER of any two that
+        are concentric (so the outer washer always wins over its hole)."""
+        out = []
+        for x, y, r in sorted(rings, key=lambda t: -t[2]):     # largest first
+            if all((x - a) ** 2 + (y - b) ** 2 >= (0.6 * max(r, c)) ** 2
+                   for a, b, c in out):
+                out.append((x, y, r))
+        return out
+
+    def _sizes(self, cfg, H, W):
+        """Resolve the list of inference sizes to run. FastSAM can drop a ring
+        at one imgsz but catch it at another, so detecting at several sizes and
+        merging is far more reliable than any single size."""
+        def one(v):
+            if str(v).strip().lower() == "auto":
+                return int(min(1024, max(640, round(max(H, W) / 32.0) * 32)))
+            return int(v)
+        if bool(cfg.get("multiscale", True)):
+            spec = str(cfg.get("multiscale_sizes", "512,640,768"))
+            sizes = [one(s) for s in spec.split(",") if s.strip()]
+            return sizes or [one(cfg.get("imgsz", 640))]
+        return [one(cfg.get("imgsz", 640))]
+
     def find_rings(self, img, cfg):
         H, W = img.shape[:2]
         min_r = max(5, (H * W) ** 0.5 * float(cfg.get("min_radius_frac", 0.03)))
@@ -688,29 +715,27 @@ class Detector:
         max_af = float(cfg.get("max_area_frac", 0.25))
         min_circ = float(cfg.get("min_circ", 0.75))
         subpixel = bool(cfg.get("subpixel", True))
-        raw = cfg.get("imgsz", 640)
-        if str(raw).strip().lower() == "auto":
-            # match inference size to the input (multiple of 32, capped for CPU)
-            imgsz = int(min(1024, max(640, round(max(H, W) / 32.0) * 32)))
-        else:
-            imgsz = int(raw)
-        # normalise local contrast so a ring detects the same in a dark corner
-        # as in a bright centre (fed to the model only; geometry is unchanged).
-        det_img = apply_clahe(img) if bool(cfg.get("clahe", True)) else img
+        # CLAHE can help on flat/low-contrast belts but can also hurt on busy
+        # textured belts - off by default, fed to the model only (geometry and
+        # measurement stay on the original pixels).
+        det_img = apply_clahe(img) if bool(cfg.get("clahe", False)) else img
 
-        res = self._predict(det_img, conf, iou, imgsz)
-        rings = self._extract(res, H, W, min_r, min_af, max_af, min_circ, subpixel)
+        sizes = self._sizes(cfg, H, W)
+        found = []
+        for imgsz in sizes:
+            res = self._predict(det_img, conf, iou, imgsz)
+            found += self._extract(res, H, W, min_r, min_af, max_af,
+                                   min_circ, subpixel)
+        rings = self._merge(found)
 
-        # position-dependent miss safety net: if nothing was found, retry once
-        # with a lower confidence, a larger inference size and a looser circle
-        # test before declaring the belt empty.
+        # last-resort safety net: nothing at any scale -> one relaxed pass
+        # (lower conf, looser circularity) before declaring the belt empty.
         if not rings and bool(cfg.get("auto_retry", True)):
             conf2 = max(0.03, conf * 0.4)
-            imgsz2 = int(min(1024, max(imgsz, 1024)))
-            res = self._predict(det_img, conf2, iou, imgsz2)
+            res = self._predict(det_img, conf2, iou, max(sizes))
             rings = self._extract(res, H, W, min_r, min_af, max_af,
                                   min_circ * 0.8, subpixel)
-        return rings
+        return sorted(rings, key=lambda t: (t[1], t[0]))
 
 
 def sort_rings(rings, by="y", desc=False):
@@ -1353,19 +1378,30 @@ class App:
                         variable=self.subpixel_var).grid(
             row=r0, column=1, sticky=tk.W, pady=(6, 0))
         r0 += 1
-        self.clahe_var = tk.BooleanVar(value=bool(self.cfg.get("clahe", True)))
+        self.multiscale_var = tk.BooleanVar(
+            value=bool(self.cfg.get("multiscale", True)))
         ttk.Checkbutton(t_det,
-                        text="Even out lighting before detect (CLAHE) - "
-                             "fixes rings missed in dark/corner positions",
-                        variable=self.clahe_var).grid(
+                        text="Multi-scale detect - detect at several sizes and "
+                             "merge (fixes rings missed in some positions)",
+                        variable=self.multiscale_var).grid(
             row=r0, column=1, sticky=tk.W, pady=(6, 0))
+        r0 += 1
+        self._config_row(t_det, r0, "multiscale_sizes",
+                         "Multi-scale sizes (comma)", "text")
         r0 += 1
         self.auto_retry_var = tk.BooleanVar(
             value=bool(self.cfg.get("auto_retry", True)))
         ttk.Checkbutton(t_det,
-                        text="Auto-retry if nothing found (lower conf, larger "
-                             "imgsz) before calling belt empty",
+                        text="Auto-retry if nothing found (lower conf) before "
+                             "calling belt empty",
                         variable=self.auto_retry_var).grid(
+            row=r0, column=1, sticky=tk.W, pady=(2, 0))
+        r0 += 1
+        self.clahe_var = tk.BooleanVar(value=bool(self.cfg.get("clahe", False)))
+        ttk.Checkbutton(t_det,
+                        text="Even out lighting before detect (CLAHE) - helps "
+                             "flat belts, can hurt busy/textured belts",
+                        variable=self.clahe_var).grid(
             row=r0, column=1, sticky=tk.W, pady=(2, 0))
         r0 += 1
         self._config_row(t_det, r0, "imgsz", "Inference size (imgsz)", "text")
@@ -1637,6 +1673,9 @@ class App:
             self.cfg["subpixel"] = bool(self.subpixel_var.get())
             self.cfg["clahe"] = bool(self.clahe_var.get())
             self.cfg["auto_retry"] = bool(self.auto_retry_var.get())
+            self.cfg["multiscale"] = bool(self.multiscale_var.get())
+            self.cfg["multiscale_sizes"] = (
+                self.vars["multiscale_sizes"].get().strip() or "512,640,768")
             _isz = self.vars["imgsz"].get().strip()
             self.cfg["imgsz"] = _isz if _isz.lower() == "auto" else int(_isz)
             self.cfg["frames_avg"] = max(1, int(self.vars["frames_avg"].get()))
@@ -1673,8 +1712,9 @@ class App:
         self.measure_inner_var.set(bool(self.cfg.get("measure_inner")))
         self.model_type_var.set(self.cfg.get("model_type", "auto"))
         self.subpixel_var.set(bool(self.cfg.get("subpixel", True)))
-        self.clahe_var.set(bool(self.cfg.get("clahe", True)))
+        self.clahe_var.set(bool(self.cfg.get("clahe", False)))
         self.auto_retry_var.set(bool(self.cfg.get("auto_retry", True)))
+        self.multiscale_var.set(bool(self.cfg.get("multiscale", True)))
 
     def save(self, announce=True):
         if not self._read_fields():
