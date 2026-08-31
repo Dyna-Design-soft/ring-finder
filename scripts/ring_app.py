@@ -777,9 +777,11 @@ def refine_outer_radius(gray, cx, cy, r0):
     intensity around the ring at increasing radius and pick the OUTERMOST strong
     edge (largest |gradient|) in a band around r0 - that is where the metal meets
     the belt. Polarity-independent (works whether metal is brighter or darker).
-    Returns the refined radius, or r0 unchanged when there is no clear edge."""
+    Returns the refined radius, or r0 unchanged when there is no clear edge.
+    Conservative on purpose: a faint / low-contrast ring (where the profile is
+    flat noise) is LEFT as detected rather than snapped to a spurious edge."""
     H, W = gray.shape[:2]
-    rs = np.arange(max(4.0, 0.55 * r0), 1.55 * r0, 0.5)
+    rs = np.arange(max(4.0, 0.6 * r0), 1.45 * r0, 0.5)
     if len(rs) < 6:
         return r0
     th = np.linspace(0, 2 * np.pi, 240, endpoint=False)
@@ -792,14 +794,19 @@ def refine_outer_radius(gray, cx, cy, r0):
         prof.append(gray[ys[ok].astype(int), xs[ok].astype(int)].mean()
                     if ok.any() else 0.0)
     prof = np.array(prof)
+    # No real metal wall (flat, low-contrast) -> trust the detection. This is
+    # what stops a faint small ring being inflated to a belt-texture edge.
+    if float(prof.max() - prof.min()) < 12.0:
+        return r0
     g = np.abs(np.gradient(prof))
     gmax = float(g.max())
-    if gmax < 2.0:                       # no real edge -> trust the detection
+    if gmax < 3.5:                       # no genuine edge -> trust the detection
         return r0
-    strong = np.where(g >= 0.45 * gmax)[0]
+    thr = max(0.45 * gmax, 3.5)          # relative AND absolute floor
+    strong = np.where(g >= thr)[0]
     if len(strong) == 0:
         return r0
-    i = int(strong[-1])                  # outermost strong edge = outer metal edge
+    i = int(strong[-1])                  # outermost genuine edge = outer metal edge
     if 0 < i < len(g) - 1:               # parabolic sub-sample
         a, b, c = g[i - 1], g[i], g[i + 1]
         d = a - 2 * b + c
@@ -807,7 +814,7 @@ def refine_outer_radius(gray, cx, cy, r0):
     else:
         off = 0.0
     rod = float(rs[i] + off * (rs[1] - rs[0]))
-    return rod if 0.7 * r0 <= rod <= 1.55 * r0 else r0
+    return rod if 0.75 * r0 <= rod <= 1.45 * r0 else r0
 
 
 def inner_radius(img, x, y, r, sat_thresh=70):
