@@ -1638,23 +1638,36 @@ class App:
         os.makedirs(d, exist_ok=True)
         return d
 
+    @staticmethod
+    def _is_map_file(path):
+        """True if the JSON looks like a calibration map (has H or M)."""
+        try:
+            d = json.load(open(path))
+            return isinstance(d, dict) and ("H" in d or "M" in d)
+        except Exception:
+            return False
+
     def _refresh_profiles(self):
-        d = self._profiles_dir()
         self._profile_paths = {}
         names = []
-        # include the currently active map even if it lives elsewhere
-        active = self.vars["homography_file"].get()
-        if active and os.path.exists(active):
-            n = os.path.basename(active)
-            self._profile_paths[n] = active
-            names.append(n)
-        for f in sorted(glob.glob(os.path.join(d, "*.json"))):
-            n = os.path.basename(f)
-            if n not in self._profile_paths:
-                self._profile_paths[n] = f
+
+        def add(path):
+            if not path or not os.path.exists(path):
+                return
+            n = os.path.basename(path)
+            if n not in self._profile_paths and self._is_map_file(path):
+                self._profile_paths[n] = path
                 names.append(n)
+
+        # every map in config/ and config/profiles/, plus the active file
+        add(self.vars["homography_file"].get())
+        add(os.path.join(ROOT, "config", "robot_map.json"))
+        for folder in (os.path.join(ROOT, "config"), self._profiles_dir()):
+            for f in sorted(glob.glob(os.path.join(folder, "*.json"))):
+                add(f)
+
         self.profile_combo["values"] = names
-        cur = os.path.basename(active) if active else ""
+        cur = os.path.basename(self.vars["homography_file"].get() or "")
         if cur in names:
             self.profile_var.set(cur)
 
