@@ -81,10 +81,17 @@ DEFAULT_CONFIG = {
     "min_circ": 0.75,
     "min_radius_frac": 0.03,
     "clahe": False,                 # normalise local contrast before detect
-    "auto_retry": True,             # if 0 rings, retry once with relaxed params
+    "auto_retry": False,            # if 0 rings, retry once with relaxed params
+                                    # (off: it can fabricate a ring on empty belt)
     "multiscale": True,             # detect at several imgsz and merge (robust)
     "multiscale_sizes": "512,640,768",  # inference sizes used when multiscale on
     "refine_od": True,              # snap circle to the true outer metal edge
+    "min_dia_px": 0,                # reject rings smaller than this (px); 0=off -
+                                    # set just below your smallest real washer to
+                                    # kill belt-texture false rings on empty belt
+    "max_dia_px": 0,                # reject rings larger than this (px); 0=off
+    "max_rings": 20,                # >this many detections -> treat as empty belt
+                                    # (belt/board texture explosion); 0=off
     "measure_inner": False,         # also estimate inner diameter (hole) - best effort
     "inner_sat_thresh": 70,         # metal is below this saturation; hole above
     # ---- TCP server (sends robot XY to the controller) ----
@@ -859,6 +866,23 @@ class Detector:
             rings = self._extract(res, H, W, min_r, min_af, max_af,
                                   min_circ * 0.8, subpixel)
 
+        # size gate: drop rings outside the real part's diameter range. This is
+        # what stops belt-texture blobs (small circles) being reported as rings
+        # on an empty conveyor. 0 = off.
+        min_d = float(cfg.get("min_dia_px", 0) or 0)
+        max_d = float(cfg.get("max_dia_px", 0) or 0)
+        if min_d > 0:
+            rings = [t for t in rings if 2 * t[2] >= min_d]
+        if max_d > 0:
+            rings = [t for t in rings if 2 * t[2] <= max_d]
+
+        # texture explosion guard: a busy/empty belt (or a calibration board)
+        # can segment into dozens of fake rings - far more than a real feed
+        # ever has. Treat that as an empty conveyor rather than a pick storm.
+        max_n = int(cfg.get("max_rings", 20) or 0)
+        if max_n and len(rings) > max_n:
+            return []
+
         # snap each circle to the true outer metal edge so a thin washer reports
         # its OD, not the inner hole (measured on the ORIGINAL, un-CLAHE pixels).
         if rings and bool(cfg.get("refine_od", True)):
@@ -1595,6 +1619,19 @@ class App:
         r0 += 1
         self._config_row(t_det, r0, "frames_avg", "Frame averaging (N frames)", "text")
         r0 += 1
+        self._config_row(t_det, r0, "min_dia_px", "Min ring diameter (px, 0=off)", "text")
+        r0 += 1
+        self._config_row(t_det, r0, "max_dia_px", "Max ring diameter (px, 0=off)", "text")
+        r0 += 1
+        self._config_row(t_det, r0, "max_rings", "Empty if more than N rings", "text")
+        r0 += 1
+        ttk.Label(t_det, text="Min/Max ring diameter reject belt-texture false "
+                             "rings on an empty conveyor - set Min just below your "
+                             "smallest real washer. 'Empty if more than N' treats a "
+                             "texture explosion (busy/empty belt) as empty.",
+                  foreground="#777", wraplength=520, justify=tk.LEFT).grid(
+            row=r0, column=1, sticky=tk.W, pady=(2, 0))
+        r0 += 1
         ttk.Label(t_det, text="imgsz 640 suits ~320x240 input; use a number or "
                              "'auto' (matches the camera resolution, capped 1024). "
                              "Frame averaging pools N frames of a STATIONARY part "
@@ -1868,6 +1905,9 @@ class App:
             _isz = self.vars["imgsz"].get().strip()
             self.cfg["imgsz"] = _isz if _isz.lower() == "auto" else int(_isz)
             self.cfg["frames_avg"] = max(1, int(self.vars["frames_avg"].get()))
+            self.cfg["min_dia_px"] = float(self.vars["min_dia_px"].get() or 0)
+            self.cfg["max_dia_px"] = float(self.vars["max_dia_px"].get() or 0)
+            self.cfg["max_rings"] = int(float(self.vars["max_rings"].get() or 0))
             self.cfg["tcp_enabled"] = bool(self.tcp_enabled_var.get())
             self.cfg["tcp_host"] = self.vars["tcp_host"].get() or "0.0.0.0"
             self.cfg["tcp_port"] = int(self.vars["tcp_port"].get())
