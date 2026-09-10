@@ -38,6 +38,9 @@ CYL_DEFAULTS = {
     "cylinder_model": "",                 # path to the pin/cylinder best.pt
     "cyl_conf": 0.25,
     "cyl_imgsz": 640,
+    "cyl_min_aspect": 0.0,                # optional: reject round false hits (0=off;
+                                          # note end-on pins are round too, so raise
+                                          # with care)
     "cyl_tcp_format": "{id},{left_x},{left_y},{right_x},{right_y},{angle_deg}",
 }
 
@@ -84,7 +87,8 @@ class CylWorker(_BaseWorker):
                 return
             t0 = time.time()
             det = self._load_cyl()
-            dets = det.detect(img, float(self.cfg.get("cyl_conf", 0.25)))
+            dets = det.detect(img, float(self.cfg.get("cyl_conf", 0.25)),
+                              float(self.cfg.get("cyl_min_aspect", 1.8)))
             detect_ms = (time.time() - t0) * 1000.0
             mapper = ring_app.load_mapper(self.cfg.get("homography_file", ""))
             vis, recs = C.annotate_cylinders(img, dets, self.cfg, mapper)
@@ -193,8 +197,10 @@ class CylApp(_BaseApp):
         nb.add(tab, text="  Cylinder  ")
         self._config_row(tab, 0, "cylinder_model", "Cylinder model (.pt)", "openfile")
         self._config_row(tab, 1, "cyl_conf", "Cylinder confidence", "text")
-        self._config_row(tab, 2, "cyl_imgsz", "Cylinder imgsz", "text")
-        self._config_row(tab, 3, "cyl_tcp_format", "Cylinder TCP line", "text")
+        self._config_row(tab, 2, "cyl_min_aspect",
+                         "Min shape aspect (reject round)", "text")
+        self._config_row(tab, 3, "cyl_imgsz", "Cylinder imgsz", "text")
+        self._config_row(tab, 4, "cyl_tcp_format", "Cylinder TCP line", "text")
         ttk.Label(tab, foreground="#555", wraplength=580, justify="left",
                   text=("Mode is chosen by a file 'mode.txt' in the watch folder: "
                         "put 'cylinder' to run this model, 'circle' (or no file) to "
@@ -212,6 +218,8 @@ class CylApp(_BaseApp):
         try:
             self.cfg["cylinder_model"] = self.vars["cylinder_model"].get()
             self.cfg["cyl_conf"] = float(self.vars["cyl_conf"].get() or 0.25)
+            self.cfg["cyl_min_aspect"] = float(
+                self.vars["cyl_min_aspect"].get() or 1.8)
             self.cfg["cyl_imgsz"] = int(self.vars["cyl_imgsz"].get() or 640)
             self.cfg["cyl_tcp_format"] = (self.vars["cyl_tcp_format"].get()
                                           or CYL_DEFAULTS["cyl_tcp_format"])

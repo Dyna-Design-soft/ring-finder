@@ -92,10 +92,15 @@ class CylinderDetector:
         self.task = task
         return self
 
-    def detect(self, img_bgr, conf=0.25):
+    def detect(self, img_bgr, conf=0.25, min_aspect=1.8):
         """img_bgr: HxWx3 BGR (OpenCV). Returns a list of detections, each a
         dict with pixel geometry: class_name, confidence, cx, cy, x, y, w, h,
-        angle (deg, long-axis), points (outline or [])."""
+        angle (deg, long-axis), aspect (rotated-rect long/short), points.
+
+        min_aspect rejects detections that are not elongated enough to be a
+        real cylinder/pin (a round washer or a belt patch scores ~1.0-1.6;
+        genuine pins are ~2+). This is what keeps an EMPTY conveyor from
+        false-detecting. Set to 0 to disable the shape gate."""
         if self.model is None:
             raise RuntimeError("model not loaded - call load() first")
         res = self.model.predict(source=img_bgr[:, :, ::-1], conf=conf,
@@ -118,24 +123,37 @@ class CylinderDetector:
                     ys = [p[1] for p in points]
                     x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
                     c, ci = None, None
-                out.append(self._pack(names, ci, c, x1, y1, x2, y2, points))
+                d = self._pack(names, ci, c, x1, y1, x2, y2, points)
+                if min_aspect and d["aspect"] < min_aspect:
+                    continue                       # too round -> not a cylinder
+                out.append(d)
         elif boxes is not None:
             for i in range(len(boxes)):
                 x1, y1, x2, y2 = [float(v) for v in boxes.xyxy[i].tolist()]
                 c = float(boxes.conf[i].item())
                 ci = int(boxes.cls[i].item())
-                out.append(self._pack(names, ci, c, x1, y1, x2, y2, []))
+                d = self._pack(names, ci, c, x1, y1, x2, y2, [])
+                if min_aspect and d["aspect"] < min_aspect:
+                    continue
+                out.append(d)
         return out
 
     @staticmethod
     def _pack(names, ci, conf, x1, y1, x2, y2, points):
         w, h = x2 - x1, y2 - y1
+        # elongation from the rotated rect (falls back to the bbox for box-only)
+        if len(points) >= 3:
+            (_, _), (rw, rh), _ = cv2.minAreaRect(np.array(points, np.float32))
+        else:
+            rw, rh = w, h
+        aspect = max(rw, rh) / max(1e-6, min(rw, rh))
         return {
             "class_name": names.get(ci, str(ci)) if ci is not None else "object",
             "confidence": conf,
             "x": x1, "y": y1, "w": w, "h": h,
             "cx": x1 + w / 2.0, "cy": y1 + h / 2.0,
             "angle": orientation_angle(points),
+            "aspect": float(aspect),
             "points": points,
         }
 
