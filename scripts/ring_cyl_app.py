@@ -225,6 +225,9 @@ class CylApp(_BaseApp):
                           state="readonly", values=["circle", "cylinder"])
         cb.pack(side=tk.LEFT)
         cb.bind("<<ComboboxSelected>>", lambda e: self._write_mode())
+        # reflect the current mode's columns immediately on startup
+        if self.mode_var.get() == "cylinder":
+            self._set_columns(_CYL_COLS, _CYL_W, "cyl")
 
     def _write_mode(self):
         folder = self.cfg.get("watch_folder", "")
@@ -236,6 +239,14 @@ class CylApp(_BaseApp):
                       % self.mode_var.get())
         except Exception as e:
             self._log("could not write mode.txt: %s" % e)
+        # switch the table columns right away so the change is visible before the
+        # next image arrives
+        if self.mode_var.get() == "cylinder":
+            self._set_columns(_CYL_COLS, _CYL_W, "cyl")
+        else:
+            self._set_columns(_RING_COLS, _RING_W, "ring")
+        for row in self.tree.get_children():
+            self.tree.delete(row)
 
     def _read_fields(self):
         ok = super()._read_fields()
@@ -264,6 +275,13 @@ class CylApp(_BaseApp):
             self.tree.heading(c, text=c,
                               command=lambda cc=c: self._sort_tree(cc))
             self.tree.column(c, width=w, anchor=tk.CENTER)
+        # retitle the table panel so it reads as the right component
+        try:
+            self.tree.master.config(
+                text="Cylinders (robot mm + angle)" if mode == "cyl"
+                else "Rings (pixel + robot mm)")
+        except Exception:
+            pass
         self._tree_mode = mode
 
     def _show(self, res):
