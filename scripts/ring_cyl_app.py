@@ -210,6 +210,33 @@ class CylApp(_BaseApp):
                         "using the line above. Uses the SAME calibration map.")
                   ).grid(row=5, column=1, sticky="w", pady=(12, 0))
 
+    def _build_live(self, p):
+        super()._build_live(p)
+        import tkinter as tk
+        from tkinter import ttk
+        bar = next((ch for ch in p.winfo_children()
+                    if isinstance(ch, ttk.Frame)), None)
+        if bar is None:
+            return
+        ttk.Label(bar, text="Mode:").pack(side=tk.LEFT, padx=(16, 2))
+        self.mode_var = tk.StringVar(
+            value=C.read_mode(self.cfg.get("watch_folder", "")))
+        cb = ttk.Combobox(bar, textvariable=self.mode_var, width=9,
+                          state="readonly", values=["circle", "cylinder"])
+        cb.pack(side=tk.LEFT)
+        cb.bind("<<ComboboxSelected>>", lambda e: self._write_mode())
+
+    def _write_mode(self):
+        folder = self.cfg.get("watch_folder", "")
+        try:
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, "mode.txt"), "w") as f:
+                f.write(self.mode_var.get())
+            self._log("component mode set to '%s' (wrote mode.txt in watch folder)"
+                      % self.mode_var.get())
+        except Exception as e:
+            self._log("could not write mode.txt: %s" % e)
+
     def _read_fields(self):
         ok = super()._read_fields()
         if not ok:
