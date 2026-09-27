@@ -92,6 +92,13 @@ DEFAULT_CONFIG = {
     "max_dia_px": 0,                # reject rings larger than this (px); 0=off
     "max_rings": 20,                # >this many detections -> treat as empty belt
                                     # (belt/board texture explosion); 0=off
+    "circle_conf": 0.0,             # min detection confidence to accept a ring
+                                    # (0..1; 0=off). Belt/edge false hits score low
+    "require_full_circle": True,    # reject a circle clipped by the frame edge
+                                    # (not fully inside the field of view)
+    "edge_margin_px": 0,            # border band (px): positive = stricter (must
+                                    # sit this far inside); negative = allow up to
+                                    # |value| px of overhang before rejecting
     "measure_inner": False,         # also estimate inner diameter (hole) - best effort
     "inner_sat_thresh": 70,         # metal is below this saturation; hole above
     # ---- TCP server (sends robot XY to the controller) ----
@@ -762,20 +769,30 @@ class Detector:
                           verbose=False)[0]
 
     def _extract(self, res, H, W, min_r, min_af, max_af, min_circ, subpixel):
-        """Turn a prediction into a list of (x, y, r) rings."""
+        """Turn a prediction into a list of (x, y, r, conf) rings. conf is the
+        model's per-detection confidence (falls back to the shape circularity
+        when the model gives no score)."""
         rings = []
 
-        def add(x, y, r):
+        def add(x, y, r, conf):
             if r < min_r:
                 return
             # concentric detections (e.g. FastSAM giving the hole as well as the
             # washer) -> keep the LARGER one so the outer diameter always wins.
-            for idx, (rx, ry, rr) in enumerate(rings):
+            for idx, (rx, ry, rr, rc) in enumerate(rings):
                 if (x - rx) ** 2 + (y - ry) ** 2 < (0.6 * max(r, rr)) ** 2:
                     if r > rr:
-                        rings[idx] = (x, y, r)
+                        rings[idx] = (x, y, r, max(conf, rc))
                     return
-            rings.append((x, y, r))
+            rings.append((x, y, r, conf))
+
+        boxes = getattr(res, "boxes", None)
+        confs = None
+        if boxes is not None and getattr(boxes, "conf", None) is not None:
+            try:
+                confs = boxes.conf.cpu().numpy()
+            except Exception:
+                confs = None
 
         masks = getattr(res, "masks", None)
         if masks is not None and masks.data is not None:
@@ -795,20 +812,24 @@ class Detector:
                 circ = 4 * np.pi * cv2.contourArea(c) / (peri * peri) if peri else 0
                 if circ < min_circ:
                     continue
+                conf = float(confs[k]) if confs is not None and k < len(confs) \
+                    else float(circ)
                 if subpixel and len(c) >= 5:
                     try:
                         x, y, r = fit_circle_ls(c.reshape(-1, 2))
                     except Exception:
                         pass
-                add(x, y, r)
+                add(x, y, r, conf)
         else:
             # detection-only model (no masks): use bounding boxes as circles
-            boxes = getattr(res, "boxes", None)
             if boxes is not None:
-                for b in boxes.xyxy.cpu().numpy():
+                xyxy = boxes.xyxy.cpu().numpy()
+                for i, b in enumerate(xyxy):
                     x1, y1, x2, y2 = b
+                    conf = float(confs[i]) if confs is not None and i < len(confs) \
+                        else 1.0
                     add((x1 + x2) / 2.0, (y1 + y2) / 2.0,
-                        min(x2 - x1, y2 - y1) / 2.0)
+                        min(x2 - x1, y2 - y1) / 2.0, conf)
         return sorted(rings, key=lambda t: (t[1], t[0]))
 
     @staticmethod
@@ -816,10 +837,15 @@ class Detector:
         """Union rings from several passes, keeping the LARGER of any two that
         are concentric (so the outer washer always wins over its hole)."""
         out = []
-        for x, y, r in sorted(rings, key=lambda t: -t[2]):     # largest first
-            if all((x - a) ** 2 + (y - b) ** 2 >= (0.6 * max(r, c)) ** 2
-                   for a, b, c in out):
-                out.append((x, y, r))
+        for x, y, r, conf in sorted(rings, key=lambda t: -t[2]):   # largest first
+            merged = False
+            for j, (a, b, c, cc) in enumerate(out):
+                if (x - a) ** 2 + (y - b) ** 2 < (0.6 * max(r, c)) ** 2:
+                    out[j] = (a, b, c, max(cc, conf))   # keep larger, best conf
+                    merged = True
+                    break
+            if not merged:
+                out.append((x, y, r, conf))
         return out
 
     def _sizes(self, cfg, H, W):
@@ -866,6 +892,22 @@ class Detector:
             rings = self._extract(res, H, W, min_r, min_af, max_af,
                                   min_circ * 0.8, subpixel)
 
+        # confidence gate: keep only detections the model is sure enough about.
+        min_conf = float(cfg.get("circle_conf", 0) or 0)
+        if min_conf > 0:
+            rings = [t for t in rings if t[3] >= min_conf]
+
+        # full-circle-in-FOV gate: a washer clipped by the frame edge is only
+        # partly visible - its centre/diameter are wrong and the robot must not
+        # pick it. Drop any circle that touches/crosses the image border
+        # (edge_margin_px adds a safety band inside the border). 0 margin still
+        # rejects circles that cross the edge; require_full_circle off disables.
+        if bool(cfg.get("require_full_circle", True)):
+            m = float(cfg.get("edge_margin_px", 0) or 0)
+            rings = [t for t in rings
+                     if t[0] - t[2] >= m and t[1] - t[2] >= m
+                     and t[0] + t[2] <= W - m and t[1] + t[2] <= H - m]
+
         # size gate: drop rings outside the real part's diameter range. This is
         # what stops belt-texture blobs (small circles) being reported as rings
         # on an empty conveyor. 0 = off.
@@ -888,8 +930,8 @@ class Detector:
         if rings and bool(cfg.get("refine_od", True)):
             gray = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                                     .astype(np.float32), (3, 3), 0)
-            rings = [(x, y, refine_outer_radius(gray, x, y, r))
-                     for (x, y, r) in rings]
+            rings = [(x, y, refine_outer_radius(gray, x, y, r), conf)
+                     for (x, y, r, conf) in rings]
         return sorted(rings, key=lambda t: (t[1], t[0]))
 
 
@@ -993,9 +1035,13 @@ def annotate(img, rings, cfg=None, mapper=None):
     sat = int(cfg.get("inner_sat_thresh", 70)) if cfg else 70
     vis = img.copy()
     recs = []
-    for i, (x, y, r) in enumerate(rings):
+    for i, t in enumerate(rings):
+        x, y, r = t[0], t[1], t[2]
+        conf = t[3] if len(t) > 3 else ""
         rec = {"id": i + 1, "x": round(x, 1), "y": round(y, 1),
-               "diameter": round(2 * r, 1), "robot_x": "", "robot_y": "",
+               "diameter": round(2 * r, 1),
+               "conf": round(float(conf), 3) if conf != "" else "",
+               "robot_x": "", "robot_y": "",
                "diameter_mm": "", "inner_dia": "", "inner_dia_mm": ""}
         ir = inner_radius(img, x, y, r, sat) if do_inner else 0.0
         if ir > 0:
@@ -1233,9 +1279,9 @@ class Worker(threading.Thread):
                 return
             vis, _ = annotate(img, rings, self.cfg, None)
             self.q.put(("calib_result", {"name": name, "image": vis,
-                                         "rings": [(round(x, 1), round(y, 1),
-                                                    round(r, 1))
-                                                   for x, y, r in rings]}))
+                                         "rings": [(round(t[0], 1), round(t[1], 1),
+                                                    round(t[2], 1))
+                                                   for t in rings]}))
             self.log("calib image %s -> %d ring(s)" % (name, len(rings)))
         except Exception as e:
             self.log("calib ERROR on %s: %s" % (name, e))
@@ -1288,12 +1334,13 @@ class Worker(threading.Thread):
                         continue
                     if strat == "center":     # ring nearest the image centre
                         cx, cy = img.shape[1] / 2.0, img.shape[0] / 2.0
-                        x, y, _ = min(rings, key=lambda t: (t[0] - cx) ** 2
-                                      + (t[1] - cy) ** 2)
+                        t = min(rings, key=lambda t: (t[0] - cx) ** 2
+                                + (t[1] - cy) ** 2)
                     else:                     # largest
-                        x, y, _ = max(rings, key=lambda t: t[2])
+                        t = max(rings, key=lambda t: t[2])
+                    x, y = t[0], t[1]
                 else:
-                    x, y, _ = rings[0]
+                    x, y = rings[0][0], rings[0][1]
                 pts.append((x, y, rx, ry))
             need = 3 if self.cfg.get("calib_transform", "homography") in \
                 ("affine", "similarity") else 4
@@ -1355,12 +1402,13 @@ class Worker(threading.Thread):
                 w = csv.writer(f)
                 if new:
                     w.writerow(["timestamp", "image", "ring_id", "x_px",
-                                "y_px", "diameter_px", "robot_x", "robot_y",
+                                "y_px", "diameter_px", "conf", "robot_x", "robot_y",
                                 "diameter_mm", "inner_dia_px", "inner_dia_mm"])
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 for r in rings:
                     w.writerow([ts, image, r["id"], r["x"], r["y"],
-                                r["diameter"], r["robot_x"], r["robot_y"],
+                                r["diameter"], r.get("conf", ""),
+                                r["robot_x"], r["robot_y"],
                                 r.get("diameter_mm", ""), r.get("inner_dia", ""),
                                 r.get("inner_dia_mm", "")])
         except Exception as e:
@@ -1376,12 +1424,13 @@ class Worker(threading.Thread):
             with open(path, "w", newline="") as f:
                 w = csv.writer(f)
                 w.writerow(["timestamp", "image", "ring_id", "x_px", "y_px",
-                            "diameter_px", "robot_x", "robot_y", "diameter_mm",
-                            "inner_dia_px", "inner_dia_mm"])
+                            "diameter_px", "conf", "robot_x", "robot_y",
+                            "diameter_mm", "inner_dia_px", "inner_dia_mm"])
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 for r in rings:
                     w.writerow([ts, image, r["id"], r["x"], r["y"],
-                                r["diameter"], r["robot_x"], r["robot_y"],
+                                r["diameter"], r.get("conf", ""),
+                                r["robot_x"], r["robot_y"],
                                 r.get("diameter_mm", ""), r.get("inner_dia", ""),
                                 r.get("inner_dia_mm", "")])
         except Exception as e:
@@ -1484,10 +1533,10 @@ class App:
         self.img_canvas.bind("<Button-5>", lambda e: self._zoom(-0.25))
         right = ttk.LabelFrame(mid, text="Rings (pixel + robot mm)", padding=6)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=6, pady=6)
-        cols = ("id", "x_px", "y_px", "dia_px", "robot_x", "robot_y", "dia_mm",
-                "in_dia_px", "in_dia_mm")
+        cols = ("id", "x_px", "y_px", "dia_px", "conf", "robot_x", "robot_y",
+                "dia_mm", "in_dia_px", "in_dia_mm")
         self.tree = ttk.Treeview(right, columns=cols, show="headings", height=12)
-        for c, w in zip(cols, (28, 50, 50, 52, 78, 78, 64, 60, 62)):
+        for c, w in zip(cols, (28, 50, 50, 52, 48, 78, 78, 64, 60, 62)):
             self.tree.heading(c, text=c,
                               command=lambda cc=c: self._sort_tree(cc))
             self.tree.column(c, width=w, anchor=tk.CENTER)
@@ -1625,10 +1674,24 @@ class App:
         r0 += 1
         self._config_row(t_det, r0, "max_rings", "Empty if more than N rings", "text")
         r0 += 1
+        self._config_row(t_det, r0, "circle_conf",
+                         "Min circle confidence (0-1, 0=off)", "text")
+        r0 += 1
+        self.full_circle_var = tk.BooleanVar(
+            value=bool(self.cfg.get("require_full_circle", True)))
+        ttk.Checkbutton(t_det, text="Only detect circles fully inside the FOV "
+                                    "(reject rings clipped by the frame edge)",
+                        variable=self.full_circle_var).grid(
+            row=r0, column=1, sticky=tk.W, pady=(4, 0))
+        r0 += 1
+        self._config_row(t_det, r0, "edge_margin_px", "FOV edge margin (px)", "text")
+        r0 += 1
         ttk.Label(t_det, text="Min/Max ring diameter reject belt-texture false "
                              "rings on an empty conveyor - set Min just below your "
                              "smallest real washer. 'Empty if more than N' treats a "
-                             "texture explosion (busy/empty belt) as empty.",
+                             "texture explosion as empty. Min circle confidence "
+                             "gates on the model's score. 'Fully inside the FOV' "
+                             "drops any ring cut off by the image edge.",
                   foreground="#777", wraplength=520, justify=tk.LEFT).grid(
             row=r0, column=1, sticky=tk.W, pady=(2, 0))
         r0 += 1
@@ -1908,6 +1971,9 @@ class App:
             self.cfg["min_dia_px"] = float(self.vars["min_dia_px"].get() or 0)
             self.cfg["max_dia_px"] = float(self.vars["max_dia_px"].get() or 0)
             self.cfg["max_rings"] = int(float(self.vars["max_rings"].get() or 0))
+            self.cfg["circle_conf"] = float(self.vars["circle_conf"].get() or 0)
+            self.cfg["require_full_circle"] = bool(self.full_circle_var.get())
+            self.cfg["edge_margin_px"] = float(self.vars["edge_margin_px"].get() or 0)
             self.cfg["tcp_enabled"] = bool(self.tcp_enabled_var.get())
             self.cfg["tcp_host"] = self.vars["tcp_host"].get() or "0.0.0.0"
             self.cfg["tcp_port"] = int(self.vars["tcp_port"].get())
@@ -1941,6 +2007,7 @@ class App:
         self.measure_inner_var.set(bool(self.cfg.get("measure_inner")))
         self.model_type_var.set(self.cfg.get("model_type", "auto"))
         self.subpixel_var.set(bool(self.cfg.get("subpixel", True)))
+        self.full_circle_var.set(bool(self.cfg.get("require_full_circle", True)))
         self.clahe_var.set(bool(self.cfg.get("clahe", False)))
         self.auto_retry_var.set(bool(self.cfg.get("auto_retry", True)))
         self.multiscale_var.set(bool(self.cfg.get("multiscale", True)))
@@ -2511,7 +2578,7 @@ class App:
             self.tree.delete(row)
         for r in res["rings"]:
             self.tree.insert("", tk.END, values=(
-                r["id"], r["x"], r["y"], r["diameter"],
+                r["id"], r["x"], r["y"], r["diameter"], r.get("conf", ""),
                 r["robot_x"], r["robot_y"], r.get("diameter_mm", ""),
                 r.get("inner_dia", ""), r.get("inner_dia_mm", "")))
 

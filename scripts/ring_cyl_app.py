@@ -176,9 +176,9 @@ def _find_notebook(widget):
 
 
 # the ring table columns, to restore when switching back from cylinder mode
-_RING_COLS = ("id", "x_px", "y_px", "dia_px", "robot_x", "robot_y", "dia_mm",
-              "in_dia_px", "in_dia_mm")
-_RING_W = (28, 50, 50, 52, 78, 78, 64, 60, 62)
+_RING_COLS = ("id", "x_px", "y_px", "dia_px", "conf", "robot_x", "robot_y",
+              "dia_mm", "in_dia_px", "in_dia_mm")
+_RING_W = (28, 50, 50, 52, 48, 78, 78, 64, 60, 62)
 _CYL_COLS = ("id", "left_x", "left_y", "right_x", "right_y", "angle_deg",
              "cx_mm", "cy_mm")
 _CYL_W = (28, 72, 72, 72, 72, 66, 72, 72)
