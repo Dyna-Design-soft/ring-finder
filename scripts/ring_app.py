@@ -86,6 +86,9 @@ DEFAULT_CONFIG = {
     "multiscale": True,             # detect at several imgsz and merge (robust)
     "multiscale_sizes": "512,640,768",  # inference sizes used when multiscale on
     "refine_od": True,              # snap circle to the true outer metal edge
+    "radius_inset_px": 0.0,         # shrink each detected radius by this many px
+                                    # to remove FastSAM's mask halo (0=off). Set to
+                                    # ~half the oversize (measure a known ring)
     "min_dia_px": 0,                # reject rings smaller than this (px); 0=off -
                                     # set just below your smallest real washer to
                                     # kill belt-texture false rings on empty belt
@@ -932,6 +935,14 @@ class Detector:
                                     .astype(np.float32), (3, 3), 0)
             rings = [(x, y, refine_outer_radius(gray, x, y, r), conf)
                      for (x, y, r, conf) in rings]
+
+        # halo correction: FastSAM masks sit a few px outside the real metal, so
+        # the circle reads larger than the object. Subtract a fixed inset from
+        # each radius to hug the true edge (0 = off).
+        inset = float(cfg.get("radius_inset_px", 0) or 0)
+        if inset > 0:
+            rings = [(x, y, max(1.0, r - inset), conf)
+                     for (x, y, r, conf) in rings]
         return sorted(rings, key=lambda t: (t[1], t[0]))
 
 
@@ -1686,6 +1697,9 @@ class App:
         r0 += 1
         self._config_row(t_det, r0, "edge_margin_px", "FOV edge margin (px)", "text")
         r0 += 1
+        self._config_row(t_det, r0, "radius_inset_px",
+                         "Radius inset (px, shrink to hug object)", "text")
+        r0 += 1
         ttk.Label(t_det, text="Min/Max ring diameter reject belt-texture false "
                              "rings on an empty conveyor - set Min just below your "
                              "smallest real washer. 'Empty if more than N' treats a "
@@ -1974,6 +1988,8 @@ class App:
             self.cfg["circle_conf"] = float(self.vars["circle_conf"].get() or 0)
             self.cfg["require_full_circle"] = bool(self.full_circle_var.get())
             self.cfg["edge_margin_px"] = float(self.vars["edge_margin_px"].get() or 0)
+            self.cfg["radius_inset_px"] = float(
+                self.vars["radius_inset_px"].get() or 0)
             self.cfg["tcp_enabled"] = bool(self.tcp_enabled_var.get())
             self.cfg["tcp_host"] = self.vars["tcp_host"].get() or "0.0.0.0"
             self.cfg["tcp_port"] = int(self.vars["tcp_port"].get())
