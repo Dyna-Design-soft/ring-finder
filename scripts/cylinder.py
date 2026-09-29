@@ -142,35 +142,50 @@ class CylinderDetector:
     def _pack(names, ci, conf, x1, y1, x2, y2, points):
         w, h = x2 - x1, y2 - y1
         bcx, bcy = x1 + w / 2.0, y1 + h / 2.0
-        # Rotated rectangle (minAreaRect) gives the TRUE length/width and a box
-        # that hugs a tilted cylinder, unlike the axis-aligned bbox.
-        if len(points) >= 3:
-            rect = cv2.minAreaRect(np.array(points, np.float32))
+        # Sub-pixel geometry from image moments of the whole mask outline (uses
+        # every outline point, not just the extreme corners minAreaRect keys on),
+        # so centre / angle / length / width are steadier at low resolution.
+        pts = np.array(points, np.float32) if len(points) >= 3 else None
+        M = cv2.moments(pts) if pts is not None else None
+        if M is not None and abs(M["m00"]) > 1e-6:
+            rcx = M["m10"] / M["m00"]
+            rcy = M["m01"] / M["m00"]
+            mu20 = M["mu20"] / M["m00"]
+            mu02 = M["mu02"] / M["m00"]
+            mu11 = M["mu11"] / M["m00"]
+            a = 0.5 * math.atan2(2 * mu11, mu20 - mu02)     # principal axis
+            ca, sa = math.cos(a), math.sin(a)
+            pl = (pts[:, 0] - rcx) * ca + (pts[:, 1] - rcy) * sa   # along axis
+            pw = -(pts[:, 0] - rcx) * sa + (pts[:, 1] - rcy) * ca  # across axis
+            length = float(np.percentile(pl, 98) - np.percentile(pl, 2))
+            width = float(np.percentile(pw, 98) - np.percentile(pw, 2))
+            if width > length:                    # keep length = long side
+                length, width = width, length
+                a += math.pi / 2.0
+        elif pts is not None:                     # degenerate polygon
+            rect = cv2.minAreaRect(pts)
             (rcx, rcy), (rw, rh), ang = rect
-            corners = cv2.boxPoints(rect).tolist()
-        else:                                    # box-only fallback
-            rcx, rcy, rw, rh, ang = bcx, bcy, w, h, 0.0
-            corners = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-        length = max(rw, rh)                      # long side (height)
-        width = min(rw, rh)                       # short side (diameter)
+            length, width = max(rw, rh), min(rw, rh)
+            a = math.radians(ang if rw >= rh else ang + 90.0)
+        else:                                     # box-only fallback
+            rcx, rcy, length, width, a = bcx, bcy, max(w, h), min(w, h), 0.0
         aspect = length / max(1e-6, width)
-        a = math.radians(ang if rw >= rh else ang + 90.0)   # long-axis dir
         ldx, ldy = math.cos(a), math.sin(a)
-        sdx, sdy = -ldy, ldx                                 # short-axis dir
+        sdx, sdy = -ldy, ldx
         end1 = (rcx - length / 2 * ldx, rcy - length / 2 * ldy)
         end2 = (rcx + length / 2 * ldx, rcy + length / 2 * ldy)
         side1 = (rcx - width / 2 * sdx, rcy - width / 2 * sdy)
         side2 = (rcx + width / 2 * sdx, rcy + width / 2 * sdy)
-        # left = the end with the smaller image-x, right = the other
-        if end1[0] <= end2[0]:
-            left, right = end1, end2
-        else:
-            left, right = end2, end1
+        hx, hy = length / 2 * ldx, length / 2 * ldy
+        wx, wy = width / 2 * sdx, width / 2 * sdy
+        corners = [[rcx - hx - wx, rcy - hy - wy], [rcx + hx - wx, rcy + hy - wy],
+                   [rcx + hx + wx, rcy + hy + wy], [rcx - hx + wx, rcy - hy + wy]]
+        left, right = (end1, end2) if end1[0] <= end2[0] else (end2, end1)
         return {
             "class_name": names.get(ci, str(ci)) if ci is not None else "object",
             "confidence": conf,
             "x": x1, "y": y1, "w": w, "h": h,
-            "cx": rcx, "cy": rcy,                 # rotated-rect centre (accurate)
+            "cx": rcx, "cy": rcy,                 # sub-pixel centre
             "angle": orientation_angle(points),
             "aspect": float(aspect),
             "length_px": float(length), "width_px": float(width),
