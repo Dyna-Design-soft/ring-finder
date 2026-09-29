@@ -35,6 +35,8 @@ _BaseWorker = ring_app.Worker
 _BaseApp = ring_app.App
 
 CYL_DEFAULTS = {
+    "component_type": "ring",             # "ring" | "cylinder" | "marker"
+                                          # (marker = decide from mode.txt file)
     "cylinder_model": "",                 # path to the pin/cylinder best.pt
     "cyl_conf": 0.25,
     "cyl_imgsz": 640,
@@ -74,6 +76,12 @@ class CylWorker(_BaseWorker):
         return self._cyl
 
     def _mode(self):
+        ct = str(self.cfg.get("component_type", "ring")).lower()
+        if ct == "cylinder":
+            return "cylinder"
+        if ct in ("ring", "circle"):
+            return "circle"
+        # "marker" (or anything else) -> decide from mode.txt in the watch folder
         return C.read_mode(self.cfg.get("watch_folder", ""), "circle")
 
     def _process(self, path, allow_avg=True):
@@ -189,26 +197,35 @@ class CylApp(_BaseApp):
         super()._build_config(page)
         for k, v in CYL_DEFAULTS.items():
             self.cfg.setdefault(k, v)
+        import tkinter as tk
         from tkinter import ttk
         nb = _find_notebook(page)
         if nb is None:
             return
         tab = ttk.Frame(nb, padding=10)
         nb.add(tab, text="  Cylinder  ")
-        self._config_row(tab, 0, "cylinder_model", "Cylinder model (.pt)", "openfile")
-        self._config_row(tab, 1, "cyl_conf", "Cylinder confidence", "text")
-        self._config_row(tab, 2, "cyl_min_aspect",
+        ttk.Label(tab, text="Component type", width=26).grid(
+            row=0, column=0, sticky="w", pady=4)
+        self.component_var = tk.StringVar(
+            value=str(self.cfg.get("component_type", "ring")).lower())
+        ttk.Combobox(tab, textvariable=self.component_var, width=12,
+                     state="readonly", values=["ring", "cylinder", "marker"]).grid(
+            row=0, column=1, sticky="w")
+        self._config_row(tab, 1, "cylinder_model", "Cylinder model (.pt)", "openfile")
+        self._config_row(tab, 2, "cyl_conf", "Cylinder confidence", "text")
+        self._config_row(tab, 3, "cyl_min_aspect",
                          "Min shape aspect (reject round)", "text")
-        self._config_row(tab, 3, "cyl_imgsz", "Cylinder imgsz", "text")
-        self._config_row(tab, 4, "cyl_tcp_format", "Cylinder TCP line", "text")
+        self._config_row(tab, 4, "cyl_imgsz", "Cylinder imgsz", "text")
+        self._config_row(tab, 5, "cyl_tcp_format", "Cylinder TCP line", "text")
         ttk.Label(tab, foreground="#555", wraplength=580, justify="left",
-                  text=("Mode is chosen by a file 'mode.txt' in the watch folder: "
-                        "put 'cylinder' to run this model, 'circle' (or no file) to "
-                        "run the ring pipeline. Cylinder output = left/right/center "
-                        "in robot mm + angle (robot frame); it is written to the "
-                        "output/latest CSV with a '_cyl' suffix, and sent over TCP "
-                        "using the line above. Uses the SAME calibration map.")
-                  ).grid(row=5, column=1, sticky="w", pady=(12, 0))
+                  text=("Component type selects the pipeline: 'ring' (circle "
+                        "detection) or 'cylinder' (this pin model); 'marker' "
+                        "decides from a mode.txt file in the watch folder. The Live "
+                        "tab has the same selector. Cylinder output = left/right/"
+                        "center in robot mm + angle (robot frame), written to the "
+                        "output/latest CSV with a '_cyl' suffix and sent over TCP "
+                        "using the line above. Both use the SAME calibration map.")
+                  ).grid(row=6, column=1, sticky="w", pady=(12, 0))
 
     def _build_live(self, p):
         super()._build_live(p)
@@ -218,30 +235,42 @@ class CylApp(_BaseApp):
                     if isinstance(ch, ttk.Frame)), None)
         if bar is None:
             return
-        ttk.Label(bar, text="Mode:").pack(side=tk.LEFT, padx=(16, 2))
+        ttk.Label(bar, text="Component:").pack(side=tk.LEFT, padx=(16, 2))
         self.mode_var = tk.StringVar(
-            value=C.read_mode(self.cfg.get("watch_folder", "")))
+            value=str(self.cfg.get("component_type", "ring")).lower())
         cb = ttk.Combobox(bar, textvariable=self.mode_var, width=9,
-                          state="readonly", values=["circle", "cylinder"])
+                          state="readonly", values=["ring", "cylinder", "marker"])
         cb.pack(side=tk.LEFT)
         cb.bind("<<ComboboxSelected>>", lambda e: self._write_mode())
-        # reflect the current mode's columns immediately on startup
-        if self.mode_var.get() == "cylinder":
+        # reflect the current component's columns immediately on startup
+        if self._mode_is_cyl():
             self._set_columns(_CYL_COLS, _CYL_W, "cyl")
 
+    def _mode_is_cyl(self):
+        sel = str(self.mode_var.get()).lower() if hasattr(self, "mode_var") \
+            else str(self.cfg.get("component_type", "ring")).lower()
+        if sel == "cylinder":
+            return True
+        if sel in ("ring", "circle"):
+            return False
+        return C.read_mode(self.cfg.get("watch_folder", ""), "circle") == "cylinder"
+
     def _write_mode(self):
-        folder = self.cfg.get("watch_folder", "")
+        sel = str(self.mode_var.get()).lower()
+        self.cfg["component_type"] = sel
         try:
-            os.makedirs(folder, exist_ok=True)
-            with open(os.path.join(folder, "mode.txt"), "w") as f:
-                f.write(self.mode_var.get())
-            self._log("component mode set to '%s' (wrote mode.txt in watch folder)"
-                      % self.mode_var.get())
-        except Exception as e:
-            self._log("could not write mode.txt: %s" % e)
+            save_config = __import__("ring_app").save_config
+            save_config(self.cfg)
+        except Exception:
+            pass
+        # keep the config dropdown (if built) in sync
+        if hasattr(self, "component_var"):
+            self.component_var.set(sel)
+        self._log("component set to '%s'%s" % (sel,
+                  " (uses mode.txt in the watch folder)" if sel == "marker" else ""))
         # switch the table columns right away so the change is visible before the
         # next image arrives
-        if self.mode_var.get() == "cylinder":
+        if self._mode_is_cyl():
             self._set_columns(_CYL_COLS, _CYL_W, "cyl")
         else:
             self._set_columns(_RING_COLS, _RING_W, "ring")
@@ -254,16 +283,20 @@ class CylApp(_BaseApp):
             return False
         from tkinter import messagebox
         try:
+            self.cfg["component_type"] = (self.component_var.get() or "ring").lower()
             self.cfg["cylinder_model"] = self.vars["cylinder_model"].get()
             self.cfg["cyl_conf"] = float(self.vars["cyl_conf"].get() or 0.25)
             self.cfg["cyl_min_aspect"] = float(
-                self.vars["cyl_min_aspect"].get() or 1.8)
+                self.vars["cyl_min_aspect"].get() or 0.0)
             self.cfg["cyl_imgsz"] = int(self.vars["cyl_imgsz"].get() or 640)
             self.cfg["cyl_tcp_format"] = (self.vars["cyl_tcp_format"].get()
                                           or CYL_DEFAULTS["cyl_tcp_format"])
         except ValueError as e:
             messagebox.showerror("Invalid value", "Cylinder settings: %s" % e)
             return False
+        # keep the Live-tab selector in sync with the config dropdown
+        if hasattr(self, "mode_var"):
+            self.mode_var.set(self.cfg["component_type"])
         return ok
 
     def _set_columns(self, cols, widths, mode):

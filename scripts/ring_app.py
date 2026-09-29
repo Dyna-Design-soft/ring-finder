@@ -85,6 +85,7 @@ DEFAULT_CONFIG = {
                                     # (off: it can fabricate a ring on empty belt)
     "multiscale": True,             # detect at several imgsz and merge (robust)
     "multiscale_sizes": "512,640,768",  # inference sizes used when multiscale on
+    "detect_target": "outer",       # report the ring's "outer" or "inner" circle
     "refine_od": True,              # snap circle to the true outer metal edge
     "radius_inset_px": 0.0,         # shrink each detected radius by this many px
                                     # to remove FastSAM's mask halo (0=off). Set to
@@ -928,13 +929,24 @@ class Detector:
         if max_n and len(rings) > max_n:
             return []
 
-        # snap each circle to the true outer metal edge so a thin washer reports
-        # its OD, not the inner hole (measured on the ORIGINAL, un-CLAHE pixels).
-        if rings and bool(cfg.get("refine_od", True)):
+        target = str(cfg.get("detect_target", "outer")).lower()
+        do_refine = bool(cfg.get("refine_od", True))
+        if rings and (do_refine or target == "inner"):
             gray = cv2.GaussianBlur(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                                     .astype(np.float32), (3, 3), 0)
-            rings = [(x, y, refine_outer_radius(gray, x, y, r), conf)
-                     for (x, y, r, conf) in rings]
+            out = []
+            for (x, y, r, conf) in rings:
+                if target == "inner":
+                    # inner circle (hole): inner edge of the metal wall band
+                    rr = wall_radius(gray, x, y, r, "inner")
+                    r = rr if rr is not None else r
+                elif do_refine:
+                    # outer edge: keep the established OD refine (works with the
+                    # radius-inset knob); the wall-band under-reads OD when a belt
+                    # highlight crosses the ring.
+                    r = refine_outer_radius(gray, x, y, r)
+                out.append((x, y, r, conf))
+            rings = out
 
         # halo correction: FastSAM masks sit a few px outside the real metal, so
         # the circle reads larger than the object. Subtract a fixed inset from
@@ -1014,6 +1026,52 @@ def refine_outer_radius(gray, cx, cy, r0):
         off = 0.0
     rod = float(rs[i] + off * (rs[1] - rs[0]))
     return rod if 0.75 * r0 <= rod <= 1.45 * r0 else r0
+
+
+def wall_radius(gray, cx, cy, r0, which="outer"):
+    """Find the ring wall as a bright annulus in the mean radial intensity
+    profile and return its INNER or OUTER edge radius (sub-pixel). The metal
+    wall is brighter than the belt on both sides; the inner edge is the hole,
+    the outer edge is the OD. Returns r0 unchanged when no clear wall is found
+    (low contrast / interfered by belt highlight)."""
+    H, W = gray.shape[:2]
+    th = np.linspace(0, 2 * np.pi, 360, endpoint=False)
+    ct, st = np.cos(th), np.sin(th)
+    # search only NEAR the mask boundary: the metal wall sits close to r0, while
+    # a belt highlight band crosses near the centre - starting at 0.6*r0 keeps
+    # the wall and skips that central interference.
+    rs = np.arange(max(3.0, 0.60 * r0), 1.30 * r0, 0.5)
+    if len(rs) < 6:
+        return None
+    prof = []
+    for rr in rs:
+        xs = cx + rr * ct
+        ys = cy + rr * st
+        ok = (xs >= 0) & (xs < W - 1) & (ys >= 0) & (ys < H - 1)
+        prof.append(gray[ys[ok].astype(int), xs[ok].astype(int)].mean()
+                    if ok.any() else 0.0)
+    prof = np.array(prof)
+    base = np.percentile(prof, 25)
+    pk = int(np.argmax(prof))
+    amp = prof[pk] - base
+    if amp < 8:
+        return None                             # no clear wall -> caller falls back
+    lvl = base + 0.5 * amp                      # half-max of the wall band
+    if which == "inner":
+        i = pk
+        while i > 0 and prof[i] > lvl:
+            i -= 1
+        if i < pk and prof[i + 1] != prof[i]:
+            f = (lvl - prof[i]) / (prof[i + 1] - prof[i])
+            return float(rs[i] + f * (rs[i + 1] - rs[i]))
+        return float(rs[i])
+    j = pk
+    while j < len(prof) - 1 and prof[j] > lvl:
+        j += 1
+    if j > pk and prof[j - 1] != prof[j]:
+        f = (prof[j - 1] - lvl) / (prof[j - 1] - prof[j])
+        return float(rs[j - 1] + f * (rs[j] - rs[j - 1]))
+    return float(rs[j])
 
 
 def inner_radius(img, x, y, r, sat_thresh=70):
@@ -1652,11 +1710,19 @@ class App:
         self._config_row(t_det, r0, "multiscale_sizes",
                          "Multi-scale sizes (comma)", "text")
         r0 += 1
+        ttk.Label(t_det, text="Detect circle", width=26).grid(
+            row=r0, column=0, sticky=tk.W, pady=4)
+        self.detect_target_var = tk.StringVar(
+            value=self.cfg.get("detect_target", "outer"))
+        ttk.Combobox(t_det, textvariable=self.detect_target_var, width=12,
+                     state="readonly", values=["outer", "inner"]).grid(
+            row=r0, column=1, sticky=tk.W)
+        r0 += 1
         self.refine_od_var = tk.BooleanVar(
             value=bool(self.cfg.get("refine_od", True)))
         ttk.Checkbutton(t_det,
                         text="Snap to outer edge (OD) - fixes thin rings "
-                             "measured as the inner hole (ID)",
+                             "measured as the inner hole (ID) [outer mode]",
                         variable=self.refine_od_var).grid(
             row=r0, column=1, sticky=tk.W, pady=(2, 0))
         r0 += 1
@@ -1979,6 +2045,7 @@ class App:
             self.cfg["multiscale_sizes"] = (
                 self.vars["multiscale_sizes"].get().strip() or "512,640,768")
             self.cfg["refine_od"] = bool(self.refine_od_var.get())
+            self.cfg["detect_target"] = self.detect_target_var.get() or "outer"
             _isz = self.vars["imgsz"].get().strip()
             self.cfg["imgsz"] = _isz if _isz.lower() == "auto" else int(_isz)
             self.cfg["frames_avg"] = max(1, int(self.vars["frames_avg"].get()))
@@ -2028,6 +2095,7 @@ class App:
         self.auto_retry_var.set(bool(self.cfg.get("auto_retry", True)))
         self.multiscale_var.set(bool(self.cfg.get("multiscale", True)))
         self.refine_od_var.set(bool(self.cfg.get("refine_od", True)))
+        self.detect_target_var.set(self.cfg.get("detect_target", "outer"))
 
     def save(self, announce=True):
         if not self._read_fields():
