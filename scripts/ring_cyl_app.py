@@ -188,8 +188,8 @@ _RING_COLS = ("id", "x_px", "y_px", "dia_px", "conf", "robot_x", "robot_y",
               "dia_mm", "in_dia_px", "in_dia_mm")
 _RING_W = (28, 50, 50, 52, 48, 78, 78, 64, 60, 62)
 _CYL_COLS = ("id", "left_x", "left_y", "right_x", "right_y", "angle_deg",
-             "cx_mm", "cy_mm")
-_CYL_W = (28, 72, 72, 72, 72, 66, 72, 72)
+             "width_mm", "height_mm", "cx_mm", "cy_mm")
+_CYL_W = (26, 66, 66, 66, 66, 60, 66, 66, 66, 66)
 
 
 class CylApp(_BaseApp):
@@ -343,7 +343,8 @@ class CylApp(_BaseApp):
         for r in res["rings"]:
             self.tree.insert("", tk.END, values=(
                 r["id"], r["left_x"], r["left_y"], r["right_x"], r["right_y"],
-                r["angle_deg"], r["cx_mm"], r["cy_mm"]))
+                r["angle_deg"], r.get("width_mm", ""), r.get("height_mm", ""),
+                r["cx_mm"], r["cy_mm"]))
 
 
 def main():

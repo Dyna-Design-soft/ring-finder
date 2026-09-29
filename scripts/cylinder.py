@@ -141,19 +141,41 @@ class CylinderDetector:
     @staticmethod
     def _pack(names, ci, conf, x1, y1, x2, y2, points):
         w, h = x2 - x1, y2 - y1
-        # elongation from the rotated rect (falls back to the bbox for box-only)
+        bcx, bcy = x1 + w / 2.0, y1 + h / 2.0
+        # Rotated rectangle (minAreaRect) gives the TRUE length/width and a box
+        # that hugs a tilted cylinder, unlike the axis-aligned bbox.
         if len(points) >= 3:
-            (_, _), (rw, rh), _ = cv2.minAreaRect(np.array(points, np.float32))
+            rect = cv2.minAreaRect(np.array(points, np.float32))
+            (rcx, rcy), (rw, rh), ang = rect
+            corners = cv2.boxPoints(rect).tolist()
+        else:                                    # box-only fallback
+            rcx, rcy, rw, rh, ang = bcx, bcy, w, h, 0.0
+            corners = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+        length = max(rw, rh)                      # long side (height)
+        width = min(rw, rh)                       # short side (diameter)
+        aspect = length / max(1e-6, width)
+        a = math.radians(ang if rw >= rh else ang + 90.0)   # long-axis dir
+        ldx, ldy = math.cos(a), math.sin(a)
+        sdx, sdy = -ldy, ldx                                 # short-axis dir
+        end1 = (rcx - length / 2 * ldx, rcy - length / 2 * ldy)
+        end2 = (rcx + length / 2 * ldx, rcy + length / 2 * ldy)
+        side1 = (rcx - width / 2 * sdx, rcy - width / 2 * sdy)
+        side2 = (rcx + width / 2 * sdx, rcy + width / 2 * sdy)
+        # left = the end with the smaller image-x, right = the other
+        if end1[0] <= end2[0]:
+            left, right = end1, end2
         else:
-            rw, rh = w, h
-        aspect = max(rw, rh) / max(1e-6, min(rw, rh))
+            left, right = end2, end1
         return {
             "class_name": names.get(ci, str(ci)) if ci is not None else "object",
             "confidence": conf,
             "x": x1, "y": y1, "w": w, "h": h,
-            "cx": x1 + w / 2.0, "cy": y1 + h / 2.0,
+            "cx": rcx, "cy": rcy,                 # rotated-rect centre (accurate)
             "angle": orientation_angle(points),
             "aspect": float(aspect),
+            "length_px": float(length), "width_px": float(width),
+            "corners": corners,
+            "left": left, "right": right, "side1": side1, "side2": side2,
             "points": points,
         }
 
@@ -179,11 +201,16 @@ def cylinder_records(dets, cfg=None, mapper=None):
     from ring_app import map_point                      # reuse the exact mapper
     ox = float(cfg.get("offset_x", 0.0)) if cfg else 0.0
     oy = float(cfg.get("offset_y", 0.0)) if cfg else 0.0
+
+    def dist_mm(pa, pb):
+        a = map_point(mapper, pa[0], pa[1])
+        b = map_point(mapper, pb[0], pb[1])
+        return math.hypot(b[0] - a[0], b[1] - a[1])
+
     recs = []
     for i, d in enumerate(dets):
-        cx, cy, x, y, w, h = d["cx"], d["cy"], d["x"], d["y"], d["w"], d["h"]
-        lpx, lpy = x, cy                 # left edge midpoint (pixel)
-        rpx, rpy = x + w, cy             # right edge midpoint (pixel)
+        cx, cy = d["cx"], d["cy"]
+        (lpx, lpy), (rpx, rpy) = d["left"], d["right"]      # rotated ends
         rec = {
             "id": i + 1,
             "class_name": d["class_name"],
@@ -191,10 +218,12 @@ def cylinder_records(dets, cfg=None, mapper=None):
             "cx_px": round(cx, 1), "cy_px": round(cy, 1),
             "left_x_px": round(lpx, 1), "left_y_px": round(lpy, 1),
             "right_x_px": round(rpx, 1), "right_y_px": round(rpy, 1),
+            "width_px": round(d["width_px"], 1), "height_px": round(d["length_px"], 1),
             "angle_px_deg": round(d["angle"], 1),
             # robot-frame fields (filled when a map is available)
             "left_x": "", "left_y": "", "right_x": "", "right_y": "",
             "cx_mm": "", "cy_mm": "", "angle_deg": "",
+            "width_mm": "", "height_mm": "",
         }
         if mapper is not None:
             lx, ly = map_point(mapper, lpx, lpy)
@@ -208,6 +237,9 @@ def cylinder_records(dets, cfg=None, mapper=None):
             rec["cy_mm"] = round(cym + oy, 3)
             rec["angle_deg"] = round(_robot_angle(mapper, map_point, cx, cy,
                                                   d["points"]), 1)
+            # height = length between the two ends; width = across the short axis
+            rec["height_mm"] = round(dist_mm(d["left"], d["right"]), 3)
+            rec["width_mm"] = round(dist_mm(d["side1"], d["side2"]), 3)
         recs.append(rec)
     return recs
 
@@ -216,8 +248,8 @@ def cylinder_records(dets, cfg=None, mapper=None):
 # app's records; pixel values kept for traceability)
 CYL_COLUMNS = ["id", "class_name", "confidence",
                "left_x", "left_y", "right_x", "right_y", "angle_deg",
-               "cx_mm", "cy_mm",
-               "cx_px", "cy_px", "angle_px_deg"]
+               "width_mm", "height_mm", "cx_mm", "cy_mm",
+               "width_px", "height_px", "cx_px", "cy_px", "angle_px_deg"]
 
 
 def annotate_cylinders(img_bgr, dets, cfg=None, mapper=None):
@@ -226,18 +258,16 @@ def annotate_cylinders(img_bgr, dets, cfg=None, mapper=None):
     vis = img_bgr.copy()
     recs = cylinder_records(dets, cfg, mapper)
     for d, rec in zip(dets, recs):
-        x, y, w, h = int(d["x"]), int(d["y"]), int(d["w"]), int(d["h"])
-        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 200, 0), 2)
-        cx, cy = d["cx"], d["cy"]
-        dx, dy = _long_axis_dir(d["points"])
-        L = 0.5 * max(w, h)
-        p1 = (int(cx - L * dx), int(cy - L * dy))
-        p2 = (int(cx + L * dx), int(cy + L * dy))
-        cv2.line(vis, p1, p2, (0, 165, 255), 2)          # long axis
-        cv2.circle(vis, (x, int(cy)), 4, (255, 0, 0), -1)        # left mid
-        cv2.circle(vis, (x + w, int(cy)), 4, (0, 0, 255), -1)    # right mid
-        label = "%d %.0fdeg" % (rec["id"], rec["angle_deg"]
-                                if rec["angle_deg"] != "" else d["angle"])
-        cv2.putText(vis, label, (x, max(12, y - 5)),
+        corners = np.array(d["corners"], np.int32).reshape(-1, 1, 2)
+        cv2.polylines(vis, [corners], True, (0, 200, 0), 2)    # rotated box hugs it
+        (lx, ly), (rx, ry) = d["left"], d["right"]
+        cv2.line(vis, (int(lx), int(ly)), (int(rx), int(ry)),
+                 (0, 165, 255), 2)                              # long axis (ends)
+        cv2.circle(vis, (int(lx), int(ly)), 4, (255, 0, 0), -1)   # left end
+        cv2.circle(vis, (int(rx), int(ry)), 4, (0, 0, 255), -1)   # right end
+        ang = rec["angle_deg"] if rec["angle_deg"] != "" else d["angle"]
+        label = "%d %.0fdeg" % (rec["id"], ang)
+        tx, ty = int(min(c[0][0] for c in corners)), int(min(c[0][1] for c in corners))
+        cv2.putText(vis, label, (tx, max(12, ty - 5)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
     return vis, recs
