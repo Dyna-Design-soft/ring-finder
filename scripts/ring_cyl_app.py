@@ -43,6 +43,7 @@ CYL_DEFAULTS = {
     "cyl_min_aspect": 0.0,                # optional: reject round false hits (0=off;
                                           # note end-on pins are round too, so raise
                                           # with care)
+    "cyl_edge_refine": True,              # snap size/position to full-res dark edges
     "cyl_tcp_format": "{id},{left_x},{left_y},{right_x},{right_y},{angle_deg}",
 }
 
@@ -96,7 +97,8 @@ class CylWorker(_BaseWorker):
             t0 = time.time()
             det = self._load_cyl()
             dets = det.detect(img, float(self.cfg.get("cyl_conf", 0.25)),
-                              float(self.cfg.get("cyl_min_aspect", 1.8)))
+                              float(self.cfg.get("cyl_min_aspect", 1.8)),
+                              edge_refine=bool(self.cfg.get("cyl_edge_refine", True)))
             detect_ms = (time.time() - t0) * 1000.0
             mapper = ring_app.load_mapper(self.cfg.get("homography_file", ""))
             vis, recs = C.annotate_cylinders(img, dets, self.cfg, mapper)
@@ -217,6 +219,12 @@ class CylApp(_BaseApp):
                          "Min shape aspect (reject round)", "text")
         self._config_row(tab, 4, "cyl_imgsz", "Cylinder imgsz", "text")
         self._config_row(tab, 5, "cyl_tcp_format", "Cylinder TCP line", "text")
+        self.cyl_edge_var = tk.BooleanVar(
+            value=bool(self.cfg.get("cyl_edge_refine", True)))
+        ttk.Checkbutton(tab, text="Refine size/position to full-res dark edges "
+                                  "(more accurate than the coarse mask)",
+                        variable=self.cyl_edge_var).grid(
+            row=6, column=1, sticky="w", pady=(4, 0))
         ttk.Label(tab, foreground="#555", wraplength=580, justify="left",
                   text=("Component type selects the pipeline: 'ring' (circle "
                         "detection) or 'cylinder' (this pin model); 'marker' "
@@ -225,7 +233,7 @@ class CylApp(_BaseApp):
                         "center in robot mm + angle (robot frame), written to the "
                         "output/latest CSV with a '_cyl' suffix and sent over TCP "
                         "using the line above. Both use the SAME calibration map.")
-                  ).grid(row=6, column=1, sticky="w", pady=(12, 0))
+                  ).grid(row=7, column=1, sticky="w", pady=(12, 0))
 
     def _build_live(self, p):
         super()._build_live(p)
@@ -288,6 +296,7 @@ class CylApp(_BaseApp):
             self.cfg["cyl_conf"] = float(self.vars["cyl_conf"].get() or 0.25)
             self.cfg["cyl_min_aspect"] = float(
                 self.vars["cyl_min_aspect"].get() or 0.0)
+            self.cfg["cyl_edge_refine"] = bool(self.cyl_edge_var.get())
             self.cfg["cyl_imgsz"] = int(self.vars["cyl_imgsz"].get() or 640)
             self.cfg["cyl_tcp_format"] = (self.vars["cyl_tcp_format"].get()
                                           or CYL_DEFAULTS["cyl_tcp_format"])

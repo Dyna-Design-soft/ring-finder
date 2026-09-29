@@ -73,6 +73,108 @@ def _long_axis_dir(points):
     return math.cos(a), math.sin(a)
 
 
+def _bar_geom(pts):
+    """Sub-pixel bar geometry from a point set (contour) via image moments:
+    centre, length, width, angle(rad), corners, ends, side mids. Uses the whole
+    outline (not just extreme corners), and trimmed 2..98 percentile extents so a
+    ragged edge doesn't inflate the size. Returns None if degenerate."""
+    pts = np.asarray(pts, np.float32)
+    if len(pts) < 3:
+        return None
+    M = cv2.moments(pts)
+    if abs(M["m00"]) < 1e-6:
+        return None
+    cx = M["m10"] / M["m00"]
+    cy = M["m01"] / M["m00"]
+    mu20 = M["mu20"] / M["m00"]
+    mu02 = M["mu02"] / M["m00"]
+    mu11 = M["mu11"] / M["m00"]
+    a = 0.5 * math.atan2(2 * mu11, mu20 - mu02)
+    ca, sa = math.cos(a), math.sin(a)
+    pl = (pts[:, 0] - cx) * ca + (pts[:, 1] - cy) * sa
+    pw = -(pts[:, 0] - cx) * sa + (pts[:, 1] - cy) * ca
+    length = float(np.percentile(pl, 98) - np.percentile(pl, 2))
+    width = float(np.percentile(pw, 98) - np.percentile(pw, 2))
+    if width > length:
+        length, width = width, length
+        a += math.pi / 2.0
+        ca, sa = math.cos(a), math.sin(a)
+    ldx, ldy, sdx, sdy = ca, sa, -sa, ca
+    end1 = (cx - length / 2 * ldx, cy - length / 2 * ldy)
+    end2 = (cx + length / 2 * ldx, cy + length / 2 * ldy)
+    side1 = (cx - width / 2 * sdx, cy - width / 2 * sdy)
+    side2 = (cx + width / 2 * sdx, cy + width / 2 * sdy)
+    hx, hy = length / 2 * ldx, length / 2 * ldy
+    wx, wy = width / 2 * sdx, width / 2 * sdy
+    corners = [[cx - hx - wx, cy - hy - wy], [cx + hx - wx, cy + hy - wy],
+               [cx + hx + wx, cy + hy + wy], [cx - hx + wx, cy - hy + wy]]
+    left, right = (end1, end2) if end1[0] <= end2[0] else (end2, end1)
+    return {"cx": cx, "cy": cy, "length_px": length, "width_px": width,
+            "corners": corners, "left": left, "right": right,
+            "side1": side1, "side2": side2}
+
+
+def _refine_fullres(gray, d):
+    """Refine a detection's geometry to the cylinder's real edges at FULL image
+    resolution. The YOLO-seg mask comes from a coarse 160-px prototype, so its
+    boundary is ~2x coarser than the 320-px frame; the cylinder is a dark bar
+    whose edges are crisp at full res. Within the detection's ROI we threshold
+    the dark pixels, take the component over the detection centre, and recompute
+    the geometry from that. Returns a possibly-updated copy; leaves d unchanged
+    if no reliable dark bar is found (keeps the model result)."""
+    pts = d.get("points")
+    if not pts or len(pts) < 3:
+        return d
+    H, W = gray.shape[:2]
+    pad = 6
+    x0 = max(0, int(d["x"]) - pad)
+    y0 = max(0, int(d["y"]) - pad)
+    x1 = min(W, int(d["x"] + d["w"]) + pad)
+    y1 = min(H, int(d["y"] + d["h"]) + pad)
+    roi = gray[y0:y1, x0:x1]
+    if roi.size < 50:
+        return d
+    thr = np.percentile(roi, 35)                    # dark portion of this ROI
+    dark = (roi < thr).astype(np.uint8)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    cnts, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return d
+    dcx, dcy = d["cx"] - x0, d["cy"] - y0
+    best, bd = None, 1e18
+    for c in cnts:
+        if cv2.contourArea(c) < 0.25 * d["length_px"] * d["width_px"]:
+            continue
+        m = cv2.moments(c)
+        if m["m00"] < 1e-6:
+            continue
+        ccx, ccy = m["m10"] / m["m00"], m["m01"] / m["m00"]
+        dist = (ccx - dcx) ** 2 + (ccy - dcy) ** 2
+        if dist < bd:
+            bd, best = dist, c
+    if best is None:
+        return d
+    cc = best.reshape(-1, 2).astype(np.float32)
+    cc[:, 0] += x0
+    cc[:, 1] += y0
+    g = _bar_geom(cc)
+    if g is None:
+        return d
+    # sanity: refined length/width must stay in a believable band vs the model
+    if not (0.6 * d["length_px"] <= g["length_px"] <= 1.4 * d["length_px"]):
+        return d
+    nd = dict(d)
+    nd.update(g)
+    nd["aspect"] = g["length_px"] / max(1e-6, g["width_px"])
+    # angle from the refined ends (image frame, [0,180))
+    dx = g["right"][0] - g["left"][0]
+    dy = g["right"][1] - g["left"][1]
+    nd["angle"] = float(math.degrees(math.atan2(dy, dx)) % 180.0)
+    return nd
+
+
+
 # ---- detector --------------------------------------------------------------
 
 class CylinderDetector:
@@ -92,7 +194,7 @@ class CylinderDetector:
         self.task = task
         return self
 
-    def detect(self, img_bgr, conf=0.25, min_aspect=1.8):
+    def detect(self, img_bgr, conf=0.25, min_aspect=1.8, edge_refine=True):
         """img_bgr: HxWx3 BGR (OpenCV). Returns a list of detections, each a
         dict with pixel geometry: class_name, confidence, cx, cy, x, y, w, h,
         angle (deg, long-axis), aspect (rotated-rect long/short), points.
@@ -100,7 +202,11 @@ class CylinderDetector:
         min_aspect rejects detections that are not elongated enough to be a
         real cylinder/pin (a round washer or a belt patch scores ~1.0-1.6;
         genuine pins are ~2+). This is what keeps an EMPTY conveyor from
-        false-detecting. Set to 0 to disable the shape gate."""
+        false-detecting. Set to 0 to disable the shape gate.
+
+        edge_refine snaps each detection's geometry to the cylinder's real dark
+        edges at full image resolution (the seg mask is ~2x coarser than the
+        frame), improving size/position; falls back to the mask if unreliable."""
         if self.model is None:
             raise RuntimeError("model not loaded - call load() first")
         res = self.model.predict(source=img_bgr[:, :, ::-1], conf=conf,
@@ -108,6 +214,7 @@ class CylinderDetector:
         names = getattr(res, "names", {}) or {}
         boxes = getattr(res, "boxes", None)
         masks = getattr(res, "masks", None)
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if edge_refine else None
         out = []
         if masks is not None and masks.xy is not None:
             for i, poly in enumerate(masks.xy):
@@ -126,6 +233,8 @@ class CylinderDetector:
                 d = self._pack(names, ci, c, x1, y1, x2, y2, points)
                 if min_aspect and d["aspect"] < min_aspect:
                     continue                       # too round -> not a cylinder
+                if edge_refine and gray is not None:
+                    d = _refine_fullres(gray, d)
                 out.append(d)
         elif boxes is not None:
             for i in range(len(boxes)):
@@ -250,8 +359,9 @@ def cylinder_records(dets, cfg=None, mapper=None):
             rec["right_y"] = round(ry + oy, 3)
             rec["cx_mm"] = round(cxm + ox, 3)
             rec["cy_mm"] = round(cym + oy, 3)
-            rec["angle_deg"] = round(_robot_angle(mapper, map_point, cx, cy,
-                                                  d["points"]), 1)
+            # robot-frame angle straight from the two mapped end points
+            rec["angle_deg"] = round(
+                math.degrees(math.atan2(ry - ly, rx - lx)) % 180.0, 1)
             # height = length between the two ends; width = across the short axis
             rec["height_mm"] = round(dist_mm(d["left"], d["right"]), 3)
             rec["width_mm"] = round(dist_mm(d["side1"], d["side2"]), 3)
