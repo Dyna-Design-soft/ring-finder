@@ -67,7 +67,9 @@ DEFAULT_CONFIG = {
     "intrinsics_file": os.path.join(ROOT, "config", "calibration.json"),  # optional
     "undistort": False,             # distortion-aware map (needs intrinsics_file)
     "calib_transform": "homography",  # homography | affine | similarity (sin/cos)
-    "batch_multi": "largest",         # if an image has >1 ring: largest|center|skip
+    "batch_multi": "confidence",       # >1 ring: confidence|largest|center|skip
+    "calib_conf": 0.06,                # detection confidence used during batch
+                                       # calibration (faint calibration rings)
     # ---- detection parameters ----
     "model": "FastSAM-x.pt",
     "model_type": "auto",           # auto | fastsam | yolo | sam
@@ -1379,7 +1381,16 @@ class Worker(threading.Thread):
             rows = read_robot_table(tables[0])
             self.log("batch calibration: %d rows from %s"
                      % (len(rows), os.path.basename(tables[0])))
-            strat = self.cfg.get("batch_multi", "largest")
+            strat = self.cfg.get("batch_multi", "confidence")
+            # calibration rings are often small/faint - detect at a low, dedicated
+            # confidence and without the live FOV/empty guards so every placed
+            # ring is found (same as the matching offline fit).
+            self.det.load(self.cfg.get("model", "FastSAM-x.pt"),
+                          self.cfg.get("model_type", "auto"))
+            dcfg = dict(self.cfg)
+            dcfg.update(conf=float(self.cfg.get("calib_conf", 0.06)),
+                        require_full_circle=False, max_rings=0,
+                        detect_target="outer")
             pts, missing, multi = [], [], []
             for iname, rx, ry in rows:
                 path = self._find_image(folder, iname)
@@ -1390,7 +1401,7 @@ class Worker(threading.Thread):
                 if img is None:
                     missing.append("%s (unreadable)" % iname)
                     continue
-                rings = self._detect_img(img)
+                rings = self.det.find_rings(img, dcfg)
                 if not rings:
                     missing.append("%s (no ring)" % iname)
                     continue
@@ -1405,8 +1416,10 @@ class Worker(threading.Thread):
                         cx, cy = img.shape[1] / 2.0, img.shape[0] / 2.0
                         t = min(rings, key=lambda t: (t[0] - cx) ** 2
                                 + (t[1] - cy) ** 2)
-                    else:                     # largest
+                    elif strat == "largest":
                         t = max(rings, key=lambda t: t[2])
+                    else:                     # confidence (default): most ring-like
+                        t = max(rings, key=lambda t: t[3] if len(t) > 3 else 0)
                     x, y = t[0], t[1]
                 else:
                     x, y = rings[0][0], rings[0][1]
@@ -1868,11 +1881,14 @@ class App:
         ttk.Button(top, text="Batch (folder + Excel)",
                    command=self.calib_batch).pack(side=tk.LEFT, padx=(14, 0))
         self.batch_multi_var = tk.StringVar(
-            value=self.cfg.get("batch_multi", "largest"))
+            value=self.cfg.get("batch_multi", "confidence"))
         ttk.Label(top, text="if many rings:").pack(side=tk.LEFT, padx=(6, 2))
-        ttk.Combobox(top, textvariable=self.batch_multi_var, width=8,
+        ttk.Combobox(top, textvariable=self.batch_multi_var, width=10,
                      state="readonly",
-                     values=["largest", "center", "skip"]).pack(side=tk.LEFT)
+                     values=["confidence", "largest", "center", "skip"]).pack(side=tk.LEFT)
+        ttk.Label(top, text="calib conf:").pack(side=tk.LEFT, padx=(10, 2))
+        self.calib_conf_var = tk.StringVar(value=str(self.cfg.get("calib_conf", 0.06)))
+        ttk.Entry(top, textvariable=self.calib_conf_var, width=6).pack(side=tk.LEFT)
         ttk.Label(top, text="Detected ring:").pack(side=tk.LEFT, padx=(14, 2))
         self.calib_ring_sel = tk.Spinbox(top, from_=1, to=1, width=4)
         self.calib_ring_sel.pack(side=tk.LEFT)
@@ -2217,7 +2233,11 @@ class App:
 
     def calib_batch(self):
         self._read_fields()          # so the map path / model / undistort are current
-        self.cfg["batch_multi"] = self.batch_multi_var.get() or "largest"
+        self.cfg["batch_multi"] = self.batch_multi_var.get() or "confidence"
+        try:
+            self.cfg["calib_conf"] = float(self.calib_conf_var.get() or 0.06)
+        except ValueError:
+            self.cfg["calib_conf"] = 0.06
         folder = filedialog.askdirectory(
             title="Folder with calibration images + Excel/CSV",
             initialdir=self.cfg.get("watch_folder", ROOT))
